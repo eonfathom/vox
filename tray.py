@@ -175,7 +175,18 @@ class Tray:
             hk = self._controller.current_hotkey_label()
         except Exception:
             hk = "?"
-        return f"Vox - {_STATE_LABEL.get(self._state, self._state)}  |  hold {hk}"
+        title = f"Vox - {_STATE_LABEL.get(self._state, self._state)}  |  hold {hk}"
+        # A dead diagnostic log is invisible by nature (windowless, no stdout),
+        # so it rides along in the one piece of UI that is always on screen.
+        try:
+            kind, _detail = self._controller.log_status()
+        except Exception:
+            kind = "ok"
+        if kind == "failed":
+            title += "  |  LOG BROKEN"
+        elif kind == "fallback":
+            title += "  |  log: fallback file"
+        return title
 
     # --- menu -----------------------------------------------------------------
     def notify(self, message, title="Vox"):

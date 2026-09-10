@@ -477,52 +477,143 @@ FILLERS = [
 
 
 # --- Diagnostic log -------------------------------------------------------------
-def _make_logger():
-    """File logger so windowless runs are diagnosable after the fact.
+# File logger so windowless runs are diagnosable after the fact.
+#
+# Under pythonw.exe there is no stdout - every print() is silently discarded -
+# so a mangled dictation leaves no trace unless the file logger works. It
+# captures per-dictation diagnostics: duration/samples captured, the raw
+# transcript, anything stripped or recovered, and the final text.
+# Default %LOCALAPPDATA%\vox\vox.log (Linux: ~/.local/state/vox/vox.log);
+# override the path with VOX_LOG, disable with VOX_LOG=0.
+#
+# WHY THIS IS DEFENSIVE (2026-09-10): the previous version returned None on any
+# OSError and log() then quietly did nothing, forever. That is exactly what
+# happened between 2026-08-29 and 2026-09-09 - Vox kept dictating and kept
+# saving debug WAVs while writing not one log line, and nothing surfaced it.
+# A logger that disables itself in silence is worse than none, because you stop
+# expecting evidence to exist. Three guarantees now:
+#   1. Never give up quietly - every exception is caught and RECORDED, and if
+#      the primary path is unusable we fall back to a per-PID sibling file
+#      (two instances racing over one file must not cost either its log).
+#   2. Self-heal - log() rebuilds a handler whose stream has died (rate-limited).
+#   3. Be loud - anything but "ok" reaches the startup banner, the tray tooltip
+#      and a balloon notification.
+_LOG_STATUS = ("failed", "not initialized")  # (ok|fallback|disabled|failed, detail)
+_LOG_DEST = ""                # the path the handler is actually writing to
+_log_lock = threading.Lock()  # serializes rebuilds only; the happy path is free
+_log_retry_at = 0.0           # monotonic deadline before the next rebuild try
+_LOG_RETRY_SEC = 30.0
 
-    Under pythonw.exe there is no stdout - every print() is silently discarded -
-    so a mangled dictation used to leave no trace. A small log file captures
-    per-dictation diagnostics: duration/samples captured, the raw transcript,
-    anything stripped or recovered, and the final text.
-    Default %LOCALAPPDATA%\\vox\\vox.log (Linux: ~/.local/state/vox/vox.log);
-    override the path with VOX_LOG, disable with VOX_LOG=0.
 
-    Rotation happens once at STARTUP (vox.log -> vox.log.1 past ~512 KB), not
-    mid-run: RotatingFileHandler's runtime rollover renames fail on Windows
-    whenever any other process still holds the file (a lingering old instance,
-    an AV scan), and a handler stuck in that state silently eats every
-    subsequent record - which once left a windowless Vox unlogged for weeks.
-    A plain always-append FileHandler cannot get into that state.
-    """
-    dest = os.environ.get("VOX_LOG", "")
+def _log_target():
+    """The configured log path, or "" when logging is switched off."""
+    dest = os.environ.get("VOX_LOG", "").strip()
     if dest.lower() in ("0", "false", "off", "no"):
-        return None
+        return ""
     if not dest:
         base = (os.environ.get("LOCALAPPDATA") if IS_WINDOWS else None
                 ) or os.path.expanduser("~/.local/state")
         dest = os.path.join(base, "vox", "vox.log")
+    return dest
+
+
+def _rotate_log(dest):
+    """Roll dest -> dest.1 past ~512 KB. Best effort, and deliberately so.
+
+    Rotation happens once at STARTUP, not mid-run: RotatingFileHandler's
+    runtime rollover renames fail on Windows whenever any other process still
+    holds the file (a lingering old instance, an AV scan), and a handler stuck
+    in that state silently eats every subsequent record. If the rename fails
+    here we simply append to a slightly oversized file - strictly better than
+    losing the log.
+    """
     try:
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        if os.path.getsize(dest) <= 512 * 1024:
+            return
+    except OSError:
+        return  # not there yet: nothing to roll
+    try:
+        os.remove(dest + ".1")
+    except OSError:
+        pass
+    try:
+        os.replace(dest, dest + ".1")
+    except OSError:
+        pass
+
+
+def _build_logger(rotate=True):
+    """(logger, (kind, detail), dest). Never raises, never returns silently.
+
+    Tries the configured path, then a per-PID sibling of it. Existing handlers
+    are closed and removed first so a rebuild can't double every subsequent
+    line - logging.getLogger("vox") is a process-wide singleton.
+    """
+    dest = _log_target()
+    if not dest:
+        return None, ("disabled", "VOX_LOG=0"), ""
+    logger = logging.getLogger("vox")
+    root, ext = os.path.splitext(dest)
+    candidates = [(dest, "ok"), (f"{root}-{os.getpid()}{ext or '.log'}", "fallback")]
+    first_err = None
+    for path, kind in candidates:
         try:
-            if os.path.getsize(dest) > 512 * 1024:
-                bak = dest + ".1"
-                if os.path.exists(bak):
-                    os.remove(bak)
-                os.replace(dest, bak)
-        except OSError:
-            pass  # missing, or locked by another holder: append to what's there
-        handler = logging.FileHandler(dest, encoding="utf-8")
-        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-        logger = logging.getLogger("vox")
+            if rotate and kind == "ok":
+                _rotate_log(path)
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            handler = logging.FileHandler(path, encoding="utf-8")
+            handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        except Exception as e:  # not just OSError - anything here must be caught
+            if first_err is None:
+                first_err = f"{path}: {e.__class__.__name__}: {e}"
+            continue
+        for old in list(logger.handlers):
+            logger.removeHandler(old)
+            try:
+                old.close()
+            except Exception:
+                pass
         logger.addHandler(handler)
         logger.setLevel(logging.INFO)
         logger.propagate = False
-        return logger
-    except OSError:
-        return None
+        detail = path if kind == "ok" else f"{path} (primary unusable - {first_err})"
+        return logger, (kind, detail), path
+    return None, ("failed", first_err or "no writable log path"), ""
 
 
-_LOGGER = _make_logger()
+def _logger_alive(logger):
+    """True while the logger still has an open stream to write into."""
+    if logger is None:
+        return False
+    for h in logger.handlers:
+        stream = getattr(h, "stream", None)
+        if stream is not None and not getattr(stream, "closed", False):
+            return True
+    return False
+
+
+_LOGGER, _LOG_STATUS, _LOG_DEST = _build_logger()
+
+
+def log_health():
+    """(kind, detail): "ok", "fallback", "disabled" or "failed"."""
+    return _LOG_STATUS
+
+
+def _relog():
+    """Rebuild a dead logger. Caller holds _log_lock. Rate-limited."""
+    global _LOGGER, _LOG_STATUS, _LOG_DEST, _log_retry_at
+    if _LOG_STATUS[0] == "disabled":
+        return  # switched off on purpose: nothing to heal
+    now = time.monotonic()
+    if now < _log_retry_at:
+        return
+    _log_retry_at = now + _LOG_RETRY_SEC
+    logger, status, dest = _build_logger(rotate=False)
+    _LOG_STATUS = status
+    if logger is not None:
+        _LOGGER, _LOG_DEST = logger, dest
+        logger.info(">> Logging recovered -> %s", dest)
 
 
 def _state_dir():
@@ -538,10 +629,56 @@ def _state_dir():
 
 def log(msg):
     """Print to the console (visible when run via python) and the log file
-    (the only record under pythonw, which has no stdout)."""
+    (the only record under pythonw, which has no stdout).
+
+    Self-healing: a handler whose stream has died is rebuilt (at most once per
+    _LOG_RETRY_SEC) rather than being tolerated forever. The healthy path takes
+    no lock - logging is already thread-safe, and log() is called from the
+    dictation hot path where a dead logger must never cost a dictation.
+    """
     print(msg, flush=True)
-    if _LOGGER is not None:
-        _LOGGER.info(msg)
+    try:
+        logger = _LOGGER
+        if not _logger_alive(logger):
+            with _log_lock:
+                if not _logger_alive(_LOGGER):
+                    _relog()
+                logger = _LOGGER
+        if logger is not None:
+            logger.info(msg)
+    except Exception:
+        pass  # a broken log must never break a dictation
+
+
+def verify_logging():
+    """Prove records actually land on disk; return the resulting (kind, detail).
+
+    Having a handler is not the same as having a log. The 2026-08/09 outage
+    left a process that believed it was logging while the file never moved, so
+    this stamps the file and checks that it grew. Cheap, and it runs once at
+    startup - after which main() makes any bad answer impossible to miss.
+    """
+    global _LOG_STATUS
+    if _LOG_STATUS[0] == "disabled":
+        return _LOG_STATUS
+    try:
+        before = os.path.getsize(_LOG_DEST) if _LOG_DEST else -1
+    except OSError:
+        before = -1
+    log(f">> Logging self-check (pid {os.getpid()})")
+    for h in list(getattr(_LOGGER, "handlers", [])):
+        try:
+            h.flush()
+        except Exception:
+            pass
+    try:
+        after = os.path.getsize(_LOG_DEST) if _LOG_DEST else -1
+    except OSError:
+        after = -1
+    if _LOGGER is None or after <= before:
+        _LOG_STATUS = ("failed",
+                       f"{_LOG_DEST or 'no path'} - writes are not reaching disk")
+    return _LOG_STATUS
 
 
 # --- Single instance ----------------------------------------------------------
@@ -3091,6 +3228,10 @@ class _TrayController:
     def model_line(self):
         return f"{MODEL_SIZE}  -  {DEVICE} ({COMPUTE_TYPE})"
 
+    def log_status(self):
+        """(kind, detail) for the tray tooltip - see log_health()."""
+        return log_health()
+
     # -- microphone picker --
     def mic_options(self):
         """[(key, label)] for the tray: system default + every real mic."""
@@ -3236,6 +3377,23 @@ def main():
             f"{len(CORRECTIONS)} corrections")
     if TRANSCRIPT_DIR:
         log(f"  Transcript dir: {TRANSCRIPT_DIR}")
+
+    # Logging health, stated every run. A windowless Vox that cannot log is
+    # undiagnosable, and that state once persisted twelve days unnoticed - so
+    # anything short of "ok" is said out loud AND put in front of the user.
+    kind, detail = verify_logging()
+    if kind == "ok":
+        log(f"  Log:    {detail}")
+    elif kind == "disabled":
+        log("  Log:    off (VOX_LOG=0)")
+    else:
+        label = ("writing to a fallback file" if kind == "fallback"
+                 else "NOT WRITING")
+        log(f"  Log:    *** {label} *** {detail}")
+        try:
+            tray.notify(f"Vox {label}: {detail}", "Vox: logging problem")
+        except Exception:
+            pass
     print("", flush=True)
 
     if IS_WINDOWS:
