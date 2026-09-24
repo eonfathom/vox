@@ -208,6 +208,8 @@ Names, jargon, and product names that Whisper mishears go in `dictionary.json`:
 - **`hotwords`** bias Whisper *during* recognition so it's more likely to hear your terms correctly.
 - **`corrections`** are a whole-word, case-insensitive find/replace applied *after* transcription — a safety net for anything it still gets wrong.
 
+**Personal names stay local:** put them in `dictionary.local.json`, next to `dictionary.json` and in the same format. Git ignores it. Its hotwords are added to the shared ones, and its corrections win over them. `VOX_DICT_LOCAL` points somewhere else. Use it for the names of people you talk about, so they never end up in a public repo.
+
 Edit the file and restart the app to reload.
 
 ## Shadow mode: compare Vox with Wispr Flow

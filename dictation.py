@@ -481,6 +481,10 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DICT_PATH = os.environ.get(
     "VOX_DICT", os.path.join(SCRIPT_DIR, "dictionary.json")
 )
+# Machine-local additions (git-ignored): see load_dictionary.
+DICT_LOCAL_PATH = os.environ.get(
+    "VOX_DICT_LOCAL", os.path.join(SCRIPT_DIR, "dictionary.local.json")
+)
 
 # Prompt that encourages proper punctuation from whisper
 INITIAL_PROMPT = "Hello, how are you? I'm doing well. Let's discuss the project."
@@ -870,23 +874,37 @@ MODEL_SIZE = os.environ.get("VOX_MODEL") or (
 
 # --- Personal dictionary ------------------------------------------------------
 def load_dictionary():
-    """Load hotwords + corrections from dictionary.json (if present).
+    """Load hotwords + corrections from dictionary.json (if present), then from
+    the machine-local overlay dictionary.local.json next to it.
 
     hotwords    : terms fed to Whisper to bias recognition toward your vocabulary
                   (names, jargon, product names) so it hears them correctly.
     corrections : {misheard: correct} applied after transcription as a safety net
                   for words Whisper still gets wrong.
+
+    The overlay is git-ignored, so the names of the people you talk about stay
+    on your machine instead of in this (public) repo: its hotwords are
+    appended (a term already listed, in any case, is skipped) and its
+    corrections override the shared ones. VOX_DICT_LOCAL moves it.
     """
     hotwords, corrections = [], {}
-    try:
-        with open(DICT_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        hotwords = data.get("hotwords") or []
-        corrections = data.get("corrections") or {}
-    except FileNotFoundError:
-        pass
-    except (json.JSONDecodeError, OSError) as e:
-        log(f"WARNING: could not read dictionary {DICT_PATH}: {e}")
+    seen = set()
+    for path in (DICT_PATH, DICT_LOCAL_PATH):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            continue
+        except (json.JSONDecodeError, OSError) as e:
+            log(f"WARNING: could not read dictionary {path}: {e}")
+            continue
+        for h in data.get("hotwords") or []:
+            if isinstance(h, str) and h.strip() and h.strip().lower() not in seen:
+                seen.add(h.strip().lower())
+                hotwords.append(h.strip())
+        for wrong, right in (data.get("corrections") or {}).items():
+            if isinstance(wrong, str) and isinstance(right, str) and wrong.strip():
+                corrections[wrong] = right
     return hotwords, corrections
 
 

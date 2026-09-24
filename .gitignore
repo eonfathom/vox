@@ -12,3 +12,6 @@ VOX_STATUS.md
 
 # Generated from assets/vox-logo.png for the Windows startup shortcut.
 assets/vox-logo.ico
+
+# Machine-local dictionary additions (personal names) - never committed.
+dictionary.local.json
