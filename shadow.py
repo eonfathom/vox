@@ -311,7 +311,14 @@ def ingest(quiet=False):
             except (wave.Error, EOFError, OSError):
                 audio_sec = None
             conn.execute(
-                "INSERT OR IGNORE INTO dictation VALUES "
+                # Named columns: the table grows (vox_capture...), a positional
+                # INSERT would break on every schema addition.
+                "INSERT OR IGNORE INTO dictation (id, ts_utc, tz_offset_min, "
+                "app, url, duration, speech_duration, num_words, wispr_status, "
+                "wispr_asr, wispr_formatted, wispr_pasted, wispr_edited, "
+                "wispr_edit_meta, wispr_latency_ms, wispr_app_version, "
+                "wispr_asr_model, mic, context_json, audio_path, audio_sec, "
+                "ingested_at) VALUES "
                 "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     tid, when.isoformat(timespec="milliseconds"),
