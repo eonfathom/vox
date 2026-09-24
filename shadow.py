@@ -157,7 +157,71 @@ def open_db():
     conn = sqlite3.connect(db_path(), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    have = {r[1] for r in conn.execute("PRAGMA table_info(dictation)")}
+    for col in ("vox_capture", "vox_capture_meta"):  # added with shadow_capture.py
+        if col not in have:
+            conn.execute(f"ALTER TABLE dictation ADD COLUMN {col} TEXT")
     return conn
+
+
+# --- Vox's own recordings (shadow_capture.py) --------------------------------------
+CAPTURE_MATCH_SEC = 1.5     # chord-down vs Wispr's start timestamp
+CAPTURE_KEEP_UNMATCHED_SEC = 600
+
+
+def match_captures(conn):
+    """Pair each capture from shadow_capture.py with the Wispr dictation that
+    began at the same moment; delete captures that match nothing once they
+    are 10 minutes old (a Ctrl+Alt shortcut, not a dictation - that audio was
+    never meant to be kept)."""
+    cap_root = os.path.join(shadow_dir(), "capture")
+    if not os.path.isdir(cap_root):
+        return 0
+    taken = {r[0] for r in conn.execute(
+        "SELECT vox_capture FROM dictation WHERE vox_capture IS NOT NULL")}
+    matched = dropped = 0
+    for month in sorted(os.listdir(cap_root)):
+        mdir = os.path.join(cap_root, month)
+        if not os.path.isdir(mdir):
+            continue
+        for name in sorted(os.listdir(mdir)):
+            if not name.endswith(".json"):
+                continue
+            meta_path = os.path.join(mdir, name)
+            wav_path = meta_path[:-5] + ".wav"
+            rel = os.path.relpath(wav_path, shadow_dir()).replace("\\", "/")
+            if rel in taken or not os.path.exists(wav_path):
+                continue
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                key_down = float(meta["key_down_utc"])
+            except (OSError, ValueError, KeyError):
+                continue
+            lo = dt.datetime.fromtimestamp(key_down - CAPTURE_MATCH_SEC, dt.timezone.utc)
+            hi = dt.datetime.fromtimestamp(key_down + CAPTURE_MATCH_SEC, dt.timezone.utc)
+            row = conn.execute(
+                "SELECT id FROM dictation WHERE vox_capture IS NULL AND "
+                "ts_utc BETWEEN ? AND ? ORDER BY ts_utc LIMIT 1",
+                (lo.isoformat(timespec="milliseconds"),
+                 hi.isoformat(timespec="milliseconds"))).fetchone()
+            if row:
+                conn.execute("UPDATE dictation SET vox_capture=?, vox_capture_meta=? "
+                             "WHERE id=?", (rel, json.dumps(meta), row[0]))
+                conn.commit()
+                taken.add(rel)
+                matched += 1
+            elif time.time() - float(meta.get("end_utc", key_down)) > CAPTURE_KEEP_UNMATCHED_SEC:
+                for p in (wav_path, meta_path):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+                dropped += 1
+    if matched or dropped:
+        say(f"capture: paired {matched} Vox recording(s) with Wispr dictations; "
+            f"deleted {dropped} that matched no dictation")
+    return matched
 
 
 # --- Ingest -----------------------------------------------------------------------
@@ -266,6 +330,7 @@ def ingest(quiet=False):
             conn.commit()
             added += 1
         _refresh_recent(src, conn, cols)
+        match_captures(conn)
         if added or not quiet:
             say(f"ingest: {added} new Wispr dictation(s) archived "
                 f"({len(known) + added} total)")
@@ -361,7 +426,10 @@ def _git_sha(vox_dir):
 #   screen_hotwords - add the names Wispr saw on screen at that moment (its
 #                     ax_context) to Vox's hotwords for that dictation: a
 #                     measurement of what screen-aware hotwords would buy.
-_VARIANT_OPTIONS = ("screen_hotwords",)
+#   audio           - "vox": replay Vox's OWN recording of the dictation
+#                     (shadow_capture.py) instead of Wispr's; dictations
+#                     without one are skipped.
+_VARIANT_OPTIONS = ("screen_hotwords", "audio")
 
 
 def config_key(variant):
@@ -408,6 +476,8 @@ def pending_ids(conn, variant, key, limit=None, ids=None):
     q = ("SELECT d.id FROM dictation d WHERE NOT EXISTS ("
          " SELECT 1 FROM run r WHERE r.dictation_id = d.id"
          " AND r.variant = ? AND r.config_key = ?)")
+    if variant.get("audio") == "vox":
+        q += " AND d.vox_capture IS NOT NULL"
     args = [variant["id"], key]
     if ids:
         q += f" AND d.id IN ({','.join('?' * len(ids))})"
@@ -619,9 +689,13 @@ def _worker(job_path):
     base_hotwords = list(getattr(vx, "HOTWORDS", []) or [])
     done = 0
     for did in job["ids"]:
-        row = conn.execute("SELECT audio_path, context_json FROM dictation "
-                           "WHERE id=?", (did,)).fetchone()
+        row = conn.execute("SELECT audio_path, vox_capture, context_json "
+                           "FROM dictation WHERE id=?", (did,)).fetchone()
         if row is None:
+            continue
+        audio_rel = (row["vox_capture"] if variant.get("audio") == "vox"
+                     else row["audio_path"])
+        if not audio_rel:
             continue
         if variant.get("screen_hotwords"):
             try:
@@ -641,7 +715,7 @@ def _worker(job_path):
         release_sec = None
         segs = 0
         try:
-            audio = _read_wav(os.path.join(sdir, row["audio_path"]))
+            audio = _read_wav(os.path.join(sdir, audio_rel))
             blocks = [audio[i:i + BLOCK].reshape(-1, 1)
                       for i in range(0, len(audio), BLOCK)]
             buf = []

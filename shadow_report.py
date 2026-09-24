@@ -468,7 +468,7 @@ def _fmt_s(x):
     return "–" if x is None else f"{x:.2f}s"
 
 
-def _summary_html(v, a, cfg, total_dictations):
+def _summary_html(v, a, cfg, total_dictations, paired=None):
     if not a["n"]:
         return (f'<p class="muted">No replays yet for this variant with its current '
                 f'code (config {html.escape(str(cfg.get("config_key")))}).</p>')
@@ -490,6 +490,8 @@ def _summary_html(v, a, cfg, total_dictations):
          "Whisper vs Wispr's ASR, before any cleanup"),
     ]
     out = [_takeaway_html(a, agree, raw_agree)]
+    if paired:
+        out.append(f'<p class="takeaway">{html.escape(paired)}</p>')
     out.append('<div class="tiles">')
     for big, label, sub in tiles:
         out.append(f'<div class="tile"><div class="big">{html.escape(big)}</div>'
@@ -563,6 +565,31 @@ def _summary_html(v, a, cfg, total_dictations):
                        + " ".join(f'<span class="chip">{html.escape(t)}</span>'
                                   for t in wd_missing) + "</p>")
     return "\n".join(out)
+
+
+def _paired_note(v, variants, results):
+    """For a variant with "compare_to": the same comparison on exactly the
+    dictations both variants replayed (e.g. Vox on its own recording vs Vox
+    on Wispr's recording of the same speech)."""
+    other = v.get("compare_to")
+    if not other or other not in {x["id"] for x in variants}:
+        return None
+    ids = {d for (d, vid) in results if vid == v["id"]} & {
+        d for (d, vid) in results if vid == other}
+    if not ids:
+        return (f"No dictation has been replayed by both this and "
+                f"'{other}' yet.")
+    def agree(vid):
+        ref = err = 0
+        for d in ids:
+            c = results[(d, vid)]["c"]
+            ref += c["n_ref"]
+            err += c["errors"]
+        return 1 - err / ref if ref else 1.0
+    label = next(x.get("label") or x["id"] for x in variants if x["id"] == other)
+    return (f"On the same {len(ids)} dictation(s): this variant matches Wispr on "
+            f"{_pct(agree(v['id']), 1)} of words; {label} on "
+            f"{_pct(agree(other), 1)}.")
 
 
 def _takeaway_html(a, agree, raw_agree):
@@ -765,7 +792,8 @@ def write_report(shadow_dir, variants, config_key_fn, path=None):
     for v in variants:
         out.append(f'<section class="vs" data-v="{html.escape(v["id"])}">'
                    '<div class="tablewrap">'
-                   + _summary_html(v, agg[v["id"]], configs[v["id"]], total)
+                   + _summary_html(v, agg[v["id"]], configs[v["id"]], total,
+                                   _paired_note(v, variants, results))
                    + "</div></section>")
     out.append('<h2>Dictations</h2><div class="controls">'
                '<label><input type="checkbox" id="only" checked> only dictations that differ</label>'
