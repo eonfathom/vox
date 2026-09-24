@@ -764,6 +764,9 @@ def write_report(shadow_dir, variants, config_key_fn, path=None):
         dt.timedelta(hours=-7), dt.timedelta(hours=-8)) else now.strftime("%Z"))
     total = len(dictations)
     audio_min = sum((d.get("audio_sec") or 0) for d in dictations) / 60
+    labelled_h = sum((d.get("audio_sec") or 0) for d in dictations
+                     if (d.get("wispr_pasted") or d.get("wispr_formatted") or "").strip()) / 3600
+    target_h = float(os.environ.get("VOX_SHADOW_TRAIN_HOURS", "5"))
     first = _local_time(dictations[-1]["ts_utc"], dictations[-1].get("tz_offset_min")) if dictations else ("", "")
     vids = [v["id"] for v in variants]
     show_css = "".join(
@@ -783,6 +786,11 @@ def write_report(shadow_dir, variants, config_key_fn, path=None):
            f'<p class="muted">{total} Wispr Flow dictations ({audio_min:.1f} min of audio, '
            f'since {html.escape(" ".join(first))}) replayed through Vox on the same audio. '
            f'Wispr\'s pasted text is the reference. Updated {html.escape(stamp)}.</p>',
+           f'<p class="muted small">Training data for a Whisper fine-tune on your voice: '
+           f'{labelled_h:.2f} h of {target_h:g} h '
+           f'({min(1.0, labelled_h / target_h if target_h else 1.0):.0%}); '
+           f'<code>shadow.py dataset</code> exports it, <code>train/finetune_whisper.py</code> '
+           f'trains it.</p>',
            '<nav class="tabs" aria-label="Vox variant">']
     for v in variants:
         out.append(f'<button type="button" data-v="{html.escape(v["id"])}" aria-pressed="false">'

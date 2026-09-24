@@ -819,6 +819,109 @@ def _llm_outcome(lines):
 
 
 # --- Status + CLI ------------------------------------------------------------------
+# --- Training data (train/finetune_whisper.py) ------------------------------------
+# Wispr's text for each archived clip is a label, so the archive doubles as a
+# fine-tuning set for Whisper on the speaker's own voice. A few minutes of
+# audio would only overfit; TRAINING_TARGET_HOURS is when a run is worth it.
+TRAINING_TARGET_HOURS = float(os.environ.get("VOX_SHADOW_TRAIN_HOURS", "5"))
+_MILESTONES_H = (1, 2, 3, 4)
+
+
+def export_dataset(out_dir, test_fraction=0.15):
+    """Write a fine-tuning set: WAV copies + metadata.jsonl (one clip per line).
+
+    Labels: "text" is what Wispr pasted (what was said, cleanly formatted);
+    "asr" is Wispr's raw recognition. The user's later edits are NOT used as
+    labels: besides fixing misrecognitions they also change what was said
+    ("the title of the section header" -> "the section header"), which would
+    teach the model to drop speech. The newest test_fraction of clips (by
+    time) is the held-out test split, so an evaluation never scores audio
+    the model trained on.
+    """
+    import shutil
+    conn = open_db()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM dictation ORDER BY ts_utc")]
+    conn.close()
+    rows = [r for r in rows if (r["wispr_pasted"] or r["wispr_formatted"] or "").strip()]
+    os.makedirs(os.path.join(out_dir, "audio"), exist_ok=True)
+    n_test = max(1, int(round(len(rows) * test_fraction))) if rows else 0
+    total = 0.0
+    with open(os.path.join(out_dir, "metadata.jsonl"), "w", encoding="utf-8") as f:
+        for i, r in enumerate(rows):
+            src = os.path.join(shadow_dir(), r["audio_path"])
+            dst_rel = f"audio/{r['id']}.wav"
+            shutil.copyfile(src, os.path.join(out_dir, dst_rel))
+            f.write(json.dumps({
+                "id": r["id"], "audio": dst_rel, "seconds": r["audio_sec"],
+                "text": (r["wispr_pasted"] or r["wispr_formatted"]).strip(),
+                "asr": (r["wispr_asr"] or "").strip(),
+                "split": "test" if i >= len(rows) - n_test else "train",
+                "ts_utc": r["ts_utc"],
+            }) + "\n")
+            total += r["audio_sec"] or 0
+    say(f"dataset: {len(rows)} clips ({total / 3600:.2f} h; {n_test} held out "
+        f"for test) -> {out_dir}")
+    return len(rows), total
+
+
+def training_progress(conn):
+    """Hours of labelled audio, and a note when a milestone is first crossed.
+
+    Milestones go to shadow.log and, when <shadow dir>/notify.json has a
+    Helm dashboard endpoint ({"helm_url": ..., "helm_token": ...}), to Helm
+    as a vox event - so reaching the fine-tuning threshold is announced, not
+    discovered."""
+    hours = (conn.execute("SELECT coalesce(sum(audio_sec), 0) FROM dictation "
+                          "WHERE coalesce(wispr_pasted, wispr_formatted, '') != ''")
+             .fetchone()[0]) / 3600.0
+    state_path = os.path.join(shadow_dir(), "milestones.json")
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            reached = set(json.load(f).get("reached", []))
+    except (OSError, ValueError):
+        reached = set()
+    new = [m for m in (*_MILESTONES_H, TRAINING_TARGET_HOURS)
+           if hours >= m and str(m) not in reached]
+    for m in new:
+        reached.add(str(m))
+        if m >= TRAINING_TARGET_HOURS:
+            msg = (f"Vox training data ready: {hours:.1f} h of Wispr-labelled audio. "
+                   "Next: shadow.py dataset, then train/finetune_whisper.py")
+        else:
+            msg = (f"Vox training data: {hours:.1f} h of {TRAINING_TARGET_HOURS:g} h "
+                   "archived")
+        say(f"milestone: {msg}")
+        _notify(msg, done=m >= TRAINING_TARGET_HOURS)
+    if new:
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump({"reached": sorted(reached)}, f)
+    return hours
+
+
+def _notify(msg, done=False):
+    try:
+        with open(os.path.join(shadow_dir(), "notify.json"), "r",
+                  encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return
+    url, token = cfg.get("helm_url"), cfg.get("helm_token")
+    if not (url and token):
+        return
+    import urllib.request
+    body = json.dumps({"project": "vox", "feature": "whisper-finetune",
+                       "event": "blocked" if done else "note",
+                       "model": "shadow.py", "note": msg}).encode()
+    req = urllib.request.Request(url, data=body, method="POST", headers={
+        "Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            say(f"notify: Helm answered {resp.status}")
+    except Exception as e:
+        say(f"notify: Helm post failed ({e.__class__.__name__}: {e})")
+
+
 def status():
     conn = open_db()
     n = conn.execute("SELECT count(*), coalesce(sum(audio_sec),0), "
@@ -827,6 +930,8 @@ def status():
     print(f"wispr db: {wispr_db_path()}")
     print(f"dictations: {n[0]} ({n[1] / 60:.1f} min of audio), "
           f"{n[2]} .. {n[3]}")
+    print(f"training data: {training_progress(conn):.2f} h of "
+          f"{TRAINING_TARGET_HOURS:g} h wanted before a fine-tuning run")
     for v in load_variants():
         key = config_key(v)
         done = conn.execute("SELECT count(*) FROM run WHERE variant=? AND "
@@ -856,6 +961,10 @@ def main():
     p_report = sub.add_parser("report", help="write report.html")
     p_report.add_argument("--open", action="store_true")
     sub.add_parser("status", help="archive + replay coverage")
+    p_ds = sub.add_parser("dataset", help="export a fine-tuning set "
+                          "(WAV + Wispr's text) for train/finetune_whisper.py")
+    p_ds.add_argument("--out", required=True)
+    p_ds.add_argument("--test-fraction", type=float, default=0.15)
     p_w = sub.add_parser("_worker")
     p_w.add_argument("job")
     args = ap.parse_args()
@@ -867,6 +976,9 @@ def main():
         return
     if args.cmd == "status":
         status()
+        return
+    if args.cmd == "dataset":
+        export_dataset(os.path.abspath(args.out), args.test_fraction)
         return
     if args.cmd in ("run", "ingest"):
         try:
@@ -881,12 +993,15 @@ def main():
                    only_variant=getattr(args, "variant", None),
                    ids=getattr(args, "ids", None))
         if args.cmd == "run":
+            conn = open_db()
+            hours = training_progress(conn)
+            conn.close()
             # Heartbeat on every run, even an idle one, so "is it still
             # running?" is answered by the data folder, not by guesswork.
             with open(os.path.join(shadow_dir(), "last-run.json"), "w",
                       encoding="utf-8") as f:
                 json.dump({"at": now_iso(), "ingested": added,
-                           "replayed": n}, f)
+                           "replayed": n, "labelled_hours": round(hours, 3)}, f)
         if args.cmd == "run" and not (n or added) and os.path.exists(
                 os.path.join(shadow_dir(), "report.html")):
             return  # nothing new: leave the report as it is

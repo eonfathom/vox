@@ -1,0 +1,9 @@
+# For train/finetune_whisper.py, in its OWN venv (not Vox's):
+#   python -m venv .venv-train
+#   .venv-train\Scripts\pip install torch --index-url https://download.pytorch.org/whl/cu124   (GPU run)
+#   .venv-train\Scripts\pip install torch --index-url https://download.pytorch.org/whl/cpu     (smoke test)
+#   .venv-train\Scripts\pip install -r train/requirements.txt
+transformers>=4.44
+peft>=0.12
+ctranslate2>=4.4
+numpy
