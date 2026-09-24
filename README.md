@@ -176,6 +176,10 @@ A comma-separated `VOX_LLM` is a preference chain: every dictation fires all bac
 
 Every configuration is **fully fail-safe**: no server/key, no internet, a timeout, or any error falls back to the raw transcript, so a dictation is never lost. Your personal `dictionary.json` corrections still run last, so brand terms like Rokid always survive.
 
+**Edit, don't rewrite (`VOX_LLM_STYLE`, default `edit`).** The model's output is treated as proposed edits and checked word by word against what you said. These edits stand: punctuation, capitals, removing fillers (um, uh, filler "like"/"so"), removing stutters and repeated false starts, dropping a phrase you corrected ("…on Monday, no wait, Tuesday"), fixing a near-spelling or homophone (carat → caret, there → their), and writing numbers as digits. Everything else the model changed is undone and your own words go back in place. Measured against Wispr Flow on the same audio (shadow mode below, 67 dictations): no cleanup matched Wispr's words 93.4% of the time. The free rewrite matched 78.2%, because it paraphrases even when told not to. Edit mode matched 94.4% and cut the sentences Vox wrongly ended at a pause from 21 to 9. `VOX_LLM_STYLE=rewrite` restores the old behaviour.
+
+**Per-machine settings.** Every `VOX_LLM*` setting can also go in `settings.local.json` next to `dictation.py` (`"llm"`, `"llm_url"`, `"llm_model"`, `"llm_style"`). That turns cleanup on for one machine without a user-wide environment variable. An environment variable still wins.
+
 **Missing-model fallback.** If the configured local model isn't actually installed on the server (a fresh machine, a pruned Ollama), every cleanup would 404 identically — and under `pythonw` nothing makes that visible, so raw text would paste for weeks. Vox now detects this at warm-up, switches to the best *installed* known-good model (`qwen3:4b-instruct` → `qwen2.5:3b-instruct` → `qwen2.5:1.5b-instruct`), and logs the `ollama pull` command that restores the configured one.
 
 ### Model size guide
