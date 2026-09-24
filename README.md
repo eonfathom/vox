@@ -206,6 +206,28 @@ Names, jargon, and product names that Whisper mishears go in `dictionary.json`:
 
 Edit the file and restart the app to reload.
 
+## Shadow mode: compare Vox with Wispr Flow
+
+Keep dictating with [Wispr Flow](https://wisprflow.ai) and let Vox run alongside it. Wispr Flow (1.6.8xx and later) stores each dictation's audio in its local history database. `shadow.py` plays that same audio through Vox and records what Vox would have pasted. You get a side-by-side comparison of the two on identical speech without dictating twice.
+
+```powershell
+.\.venv\Scripts\python.exe shadow.py run      # archive new Wispr dictations, replay them, write the report
+.\.venv\Scripts\python.exe shadow.py status   # what is archived and how much has been replayed
+.\.venv\Scripts\python.exe shadow.py report --open
+```
+
+- **Ingest:** copies each new Wispr dictation (its WAV, Wispr's raw ASR, formatted and pasted text, and your later edits) into `%LOCALAPPDATA%\vox\shadow` (`~/.local/state/vox/shadow` elsewhere; override with `--dir` or `VOX_SHADOW_DIR`). Wispr's database is only ever opened read-only. The ingest also re-reads Wispr's text for the last two days, because Wispr updates a dictation after the audio lands (formatting, then your edits).
+- **Shells inside an app container:** a shell started by an MSIX-packaged app, such as the Claude desktop app, has its AppData writes silently redirected into that package's own storage. A scheduled task then never sees them. From such a shell, pass `--dir` with a folder outside AppData, and give the scheduled task the same `--dir`.
+- **Replay:** runs Vox's real release path, `stop_and_transcribe()`. That includes segment prefetch fed at the live block and poll cadence, the echo guard, the optional cleanup pass and the dictionary. Pasting, the HUD, the tray and the daily transcript file are all stubbed out. Nothing is typed anywhere.
+- **Variants:** `variants.json` in the shadow folder lists which Vox to replay: a checkout directory plus environment overrides. You can compare "the Vox running on this PC" with the latest code, or a different cleanup model, on the same audio. Results are keyed by a hash of `dictation.py` + `dictionary.json` + env. After you change Vox, the corpus is replayed again, newest first, `--max` per run. So the growing Wispr corpus doubles as a regression suite.
+- **Report:** `report.html` next to the archive. It shows word-level diffs against Wispr's pasted text, sorts each difference into a kind (names, misheard words, missing phrases, fillers, false starts, small words, numbers, spacing), lists recurring misses and dictionary suggestions, and plays each clip. Wispr is the reference, not the truth, so the report also flags where you corrected Wispr afterwards.
+- **Schedule (Windows):** a Task Scheduler entry that runs `pythonw shadow.py run` every 15 minutes keeps the archive current. The run exits quickly when nothing is new.
+- **Capture test (`shadow_capture.py`, Windows):** replaying Wispr's audio shows which engine hears better given the same sound. It cannot show whether Vox's own recording loses something. This small process records the same speech through Vox's capture code whenever Wispr's push-to-talk chord is held: the same device, the same stream settings, the same 0.4 s pre-roll. It reads the chord from Wispr's own settings and polls the keys, with no keyboard hook. It never loads a model and never pastes. `shadow.py ingest` pairs each recording with the Wispr dictation that started at the same moment. Recordings that match no dictation are deleted after 10 minutes. A variant with `"audio": "vox"` replays Vox's recording, and `"compare_to": "<variant>"` makes the report compare it with the same Vox on Wispr's recording of the same speech. Run it at logon under Task Scheduler, with restart on failure. `--self-test` records 2 seconds and exits.
+
+- **Training data:** every archived clip comes with Wispr's text, so the archive doubles as a fine-tuning set for Whisper on your own voice. `shadow.py dataset --out <dir>` exports it. The labels are Wispr's pasted text, and the newest 15% of clips are held out for testing. `train/finetune_whisper.py` LoRA-tunes Whisper on the rest, reports the held-out word error rate before and after, and converts the result to a CTranslate2 model that Vox loads with `VOX_MODEL=<run>/ct2`. It runs in its own venv (`train/requirements.txt`). A few minutes of audio only overfits, so `shadow.py run` tracks the labelled hours. It logs each full hour and announces 5 h (`VOX_SHADOW_TRAIN_HOURS`) as ready. With a Helm endpoint in `<shadow dir>/notify.json`, the announcement goes there too. Your later edits are not used as labels, because they also change what was said.
+
+Everything the shadow writes is personal speech, and none of it belongs in this repo.
+
 ## Troubleshooting
 
 ### No text appears (Linux)
