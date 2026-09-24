@@ -736,6 +736,11 @@ def status():
 def main():
     ap = argparse.ArgumentParser(
         description="Replay Wispr Flow dictations through Vox and compare.")
+    ap.add_argument(
+        "--dir", help="data folder (default %%LOCALAPPDATA%%\\vox\\shadow; "
+        "same as VOX_SHADOW_DIR). Use a folder outside AppData when shells "
+        "run inside an MSIX app container (e.g. the Claude desktop app), "
+        "whose AppData writes are silently redirected into the package.")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p_run = sub.add_parser("run", help="ingest + replay + report")
     p_run.add_argument("--max", type=int, default=20,
@@ -751,6 +756,8 @@ def main():
     p_w = sub.add_parser("_worker")
     p_w.add_argument("job")
     args = ap.parse_args()
+    if args.dir:
+        os.environ["VOX_SHADOW_DIR"] = os.path.abspath(args.dir)
 
     if args.cmd == "_worker":
         _worker(args.job)
