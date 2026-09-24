@@ -777,6 +777,13 @@ def main():
         n = replay(max_per_variant=args.max,
                    only_variant=getattr(args, "variant", None),
                    ids=getattr(args, "ids", None))
+        if args.cmd == "run":
+            # Heartbeat on every run, even an idle one, so "is it still
+            # running?" is answered by the data folder, not by guesswork.
+            with open(os.path.join(shadow_dir(), "last-run.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"at": now_iso(), "ingested": added,
+                           "replayed": n}, f)
         if args.cmd == "run" and not (n or added) and os.path.exists(
                 os.path.join(shadow_dir(), "report.html")):
             return  # nothing new: leave the report as it is
