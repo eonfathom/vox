@@ -356,6 +356,14 @@ def _git_sha(vox_dir):
         return None
 
 
+# Replay options a variant may set besides env (they change results, so they
+# are part of its config key):
+#   screen_hotwords - add the names Wispr saw on screen at that moment (its
+#                     ax_context) to Vox's hotwords for that dictation: a
+#                     measurement of what screen-aware hotwords would buy.
+_VARIANT_OPTIONS = ("screen_hotwords",)
+
+
 def config_key(variant):
     """Identity of what a replay depends on: code, dictionary, environment."""
     h = hashlib.sha1()
@@ -367,6 +375,16 @@ def config_key(variant):
         except OSError:
             h.update(b"<missing>")
     h.update(json.dumps(variant.get("env", {}), sort_keys=True).encode())
+    # Per-machine files change behavior too, but only count when present, so
+    # adding this check did not invalidate earlier results.
+    for name in ("dictionary.local.json", "settings.local.json"):
+        p = os.path.join(variant["vox_dir"], name)
+        if os.path.exists(p):
+            with open(p, "rb") as f:
+                h.update(name.encode() + f.read())
+    opts = {k: variant[k] for k in _VARIANT_OPTIONS if variant.get(k)}
+    if opts:
+        h.update(json.dumps(opts, sort_keys=True).encode())
     return h.hexdigest()[:12]
 
 
@@ -598,12 +616,23 @@ def _worker(job_path):
     conn = sqlite3.connect(os.path.join(sdir, "shadow.sqlite"), timeout=30)
     conn.row_factory = sqlite3.Row
     pump_blocks = max(1, int(round(PUMP_EVERY_SEC * SAMPLE_RATE / BLOCK)))
+    base_hotwords = list(getattr(vx, "HOTWORDS", []) or [])
     done = 0
     for did in job["ids"]:
-        row = conn.execute("SELECT audio_path FROM dictation WHERE id=?",
-                           (did,)).fetchone()
+        row = conn.execute("SELECT audio_path, context_json FROM dictation "
+                           "WHERE id=?", (did,)).fetchone()
         if row is None:
             continue
+        if variant.get("screen_hotwords"):
+            try:
+                screen = json.loads(row["context_json"] or "{}").get(
+                    "ax_context") or []
+            except ValueError:
+                screen = []
+            known = {h.lower() for h in base_hotwords}
+            vx.HOTWORDS = base_hotwords + [
+                s for s in screen
+                if isinstance(s, str) and s.strip() and s.lower() not in known]
         lines.clear()
         pasted.clear()
         for k in timers:
