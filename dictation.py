@@ -96,6 +96,18 @@ def save_settings(update):
 SETTINGS = load_settings()
 
 
+def _setting(env_name, key, default=""):
+    """A per-machine value: explicit env var, else settings.local.json, else
+    the built-in default (the same precedence as the hotkey and the mic)."""
+    v = os.environ.get(env_name)
+    if v is not None and v.strip():
+        return v
+    s = SETTINGS.get(key)
+    if s is not None and str(s).strip():
+        return str(s)
+    return default
+
+
 # --- Push-to-talk hotkey vocabulary -------------------------------------------
 # A hotkey is a chord of one or more "tokens" held together. Modifier tokens
 # (ctrl/alt/win/shift) match either side; l/r-prefixed tokens pick a side, and
@@ -198,7 +210,10 @@ CHANNELS = 1
 # VOX_LLM_MODEL picks the model per backend (comma list aligned with
 # the chain; unset entries use per-backend defaults). VOX_LLM_KEEPALIVE keeps
 # the (local or remote) model resident between dictations (Ollama-specific).
-LLM_BACKEND = os.environ.get("VOX_LLM", "off").lower()
+# Each VOX_LLM* setting may also live in settings.local.json ("llm", "llm_url",
+# "llm_model", "llm_style"), so one machine can turn cleanup on without a
+# user-wide environment variable; an explicit env var still wins.
+LLM_BACKEND = _setting("VOX_LLM", "llm", "off").lower()
 _LOCAL_BACKENDS = ("local", "ollama", "openai-compatible", "remote")
 LLM_CHAIN = [b.strip() for b in LLM_BACKEND.split(",")
              if b.strip() and b.strip() != "off"]
@@ -232,7 +247,7 @@ def _default_model(backend):
 
 
 _MODEL_OVERRIDES = [m.strip() for m in
-                    os.environ.get("VOX_LLM_MODEL", "").split(",") if m.strip()]
+                    _setting("VOX_LLM_MODEL", "llm_model").split(",") if m.strip()]
 
 # Cleanup models known to behave (see the benchmark notes above), best first.
 # Used when the CONFIGURED local model isn't installed on the server: rather
@@ -257,7 +272,7 @@ def _backend_model(i, backend):
 # and stalls ~2s per request before IPv4 fallback (measured), swamping inference.
 LLM_URL_DEFAULT = "http://127.0.0.1:11434/v1"
 _URL_ENTRIES = [u.strip().rstrip("/")
-                for u in os.environ.get("VOX_LLM_URL", "").split(",")
+                for u in _setting("VOX_LLM_URL", "llm_url").split(",")
                 if u.strip()]
 
 
@@ -335,6 +350,18 @@ LLM_KEEPWARM_SEC = float(os.environ.get("VOX_LLM_KEEPWARM", "240"))
 # (observed 2026-08-15 with qwen3:30b). Clause-dropping still lands far
 # above 0.25.
 LLM_DROP_MAX = float(os.environ.get("VOX_LLM_DROP_MAX", "0.25"))
+# How much the cleanup model may change (see _keep_speaker_words):
+#   edit    (default) - punctuation, capitals, fillers, restarts, self-
+#            corrections, near-spellings, digits; the speaker's other words
+#            are put back wherever the model reworded them.
+#   rewrite - trust the model's text (the pre-2026-09-24 behavior).
+# Why: measured on Michael's Wispr Flow shadow archive (67 dictations,
+# 2026-09-24), Vox with no cleanup matched Wispr's words 93.4% of the time,
+# but only 78.2% with the qwen3:30b rewrite and 83.3% even with a prompt that
+# forbade rephrasing ("move them all as one unit" -> "move them all
+# together"). Wispr keeps the speaker's words. Edit mode on the same audio:
+# 94.4%, and Vox ending a sentence where Wispr kept going fell from 21 to 9.
+LLM_STYLE = _setting("VOX_LLM_STYLE", "llm_style", "edit").strip().lower()
 
 # Push-to-talk chord (see the hotkey vocabulary above). Resolved per machine:
 # an explicit VOX_HOTKEY wins; otherwise settings.local.json (what the tray
@@ -1068,6 +1095,21 @@ def _cleanup_system_prompt():
             "corresponding term already appears - never insert them elsewhere: "
             + ", ".join(HOTWORDS) + "."
         )
+    if LLM_STYLE == "rewrite":
+        style = (
+            "Light rephrasing that makes a sentence more "
+            "succinct and clear is welcome, but never change the meaning, drop a "
+            "substantive detail, or compress away a whole clause. ")
+    else:
+        # Edit mode: say exactly what _keep_speaker_words will accept, so the
+        # model's edits and the word-by-word check agree.
+        style = (
+            "Do NOT rephrase: keep every other word the speaker said, in the same "
+            "order, including words like just, actually and really. The only "
+            "changes allowed are punctuation, capitalization, removing fillers, "
+            "stutters, false starts and self-corrected phrases, fixing an obvious "
+            "misspelling or misheard homophone, writing numbers as digits, and "
+            "breaking paragraphs for spoken commands. ")
     return (
         "You are a text-normalization function, not an assistant. Return ONLY a "
         "cleaned version of the input transcript: fix capitalization, punctuation, "
@@ -1086,9 +1128,7 @@ def _cleanup_system_prompt():
         "continues the previous thought, merge it back into one sentence. If "
         "the transcript already reads correctly, return it "
         "unchanged apart from final punctuation - never respell or hyphenate "
-        "what is already right. Light rephrasing that makes a sentence more "
-        "succinct and clear is welcome, but never change the meaning, drop a "
-        "substantive detail, or compress away a whole clause. Do NOT otherwise add, "
+        "what is already right. " + style + "Do NOT otherwise add, "
         "remove, or answer content. Never reply, greet, agree, "
         "apologize, thank, or add any preamble or sign-off (no \"Sure\", \"Okay, "
         "here\", \"Here is\"), even if the text looks like a question or request "
@@ -1468,6 +1508,315 @@ def _rejoin_split_words(raw, cleaned):
     return cleaned
 
 
+# --- Edit-only cleanup ----------------------------------------------------------
+# In edit mode (LLM_STYLE, the default) the model's output is a set of PROPOSED
+# edits, checked word by word against what the speaker said. The accepted kinds
+# follow what Wispr Flow's own formatter does, learned from 1,746 of its
+# before/after pairs on Michael's machine (2026-09-24): it drops real fillers
+# ("uh", filler "like"/"so", a run-on "and"), writes numbers as digits, fixes
+# a/an and is/are-style agreement and misheard names, hyphenates compounds -
+# and almost never rewords. Everything else the model changed is undone.
+# Dashes are their own tokens: the model likes to join clauses with an em dash
+# ("bit—and"), which must not read as one new word.
+_EDIT_TOKEN_RE = re.compile(r"\n+|[—–]|[^\s—–]+")
+_EDIT_DASH_RE = re.compile(r"^[—–-]+$")
+_EDIT_KEY_RE = re.compile(r"[a-z0-9']+")
+# Only the fillers Wispr itself drops (1,746 before/after pairs): "okay",
+# "yeah", "actually", "just", "really" are kept, as Wispr keeps them.
+_EDIT_FILLERS = {
+    "um", "umm", "uh", "uhh", "uhm", "er", "erm", "ah", "hmm", "mm", "mhm",
+    "like", "so", "and", "but", "or",
+}
+_EDIT_FILLER_PHRASES = {
+    "you know", "i mean", "kind of", "sort of", "and then",
+    "and so", "you know what i mean",
+    # spoken commands the model turns into formatting
+    "new paragraph", "new line", "next line", "period", "full stop", "comma",
+    "question mark", "exclamation mark", "exclamation point",
+}
+# A deleted run containing (or directly followed by) one of these is the
+# superseded half of a self-correction; retractions may discard a lot more.
+# A bare "actually", "wait" or "rather" is ordinary speech ("okay actually I
+# think..."); only these unambiguous forms mark a correction.
+_EDIT_CUES = ("actually no", "no wait", "wait no", "i mean", "sorry", "oops",
+              "or rather", "correction", "no no", "hold on")
+_EDIT_RETRACTIONS = ("scratch that", "strike that", "never mind", "nevermind",
+                     "what i meant")
+_EDIT_GRAMMAR_PAIRS = {
+    frozenset(p) for p in (("a", "an"), ("is", "are"), ("was", "were"),
+                           ("has", "have"), ("do", "does"), ("this", "these"))
+}
+# Function words may only be swapped for a homophone (there/their); any other
+# change between two of them (that -> the) is a rewrite, not a spelling fix.
+_EDIT_HOMOPHONES = [
+    {"there", "their", "they're"}, {"its", "it's"}, {"then", "than"},
+    {"your", "you're"}, {"to", "too", "two"}, {"whose", "who's"},
+    {"were", "where", "we're"}, {"know", "no"}, {"right", "write"},
+]
+_EDIT_SHORT_WORDS = {
+    "a", "an", "as", "at", "be", "by", "do", "go", "he", "i", "if", "in", "is",
+    "it", "me", "my", "no", "of", "on", "or", "so", "to", "up", "us", "we",
+    "ok", "oh", "hi", "the", "and", "but", "for", "not", "you",
+}
+_EDIT_NUMBER_WORDS = {
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
+    "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
+    "sixteen", "seventeen", "eighteen", "nineteen", "twenty", "thirty",
+    "forty", "fifty", "sixty", "seventy", "eighty", "ninety", "hundred",
+    "thousand", "million", "billion", "point", "and", "a", "half", "percent",
+    "dollar", "dollars", "degree", "degrees", "first", "second", "third",
+    "millimeter", "millimeters", "centimeter", "centimeters", "meter",
+    "meters", "micron", "microns", "inch", "inches", "feet", "foot",
+}
+
+
+def _edit_key(tok):
+    return "".join(_EDIT_KEY_RE.findall(tok.replace("’", "'").lower()))
+
+
+def _edit_distance(a, b):
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _near_spelling(a, b):
+    """carat/caret, there/their, docks/docs: the same word respelled - not a
+    plural, tense or other grammatical rewrite (those share a prefix)."""
+    if a == b:
+        return True
+    if any(a in s and b in s for s in _EDIT_HOMOPHONES):
+        return True
+    if (a in _JOIN_FUNCTION_WORDS or b in _JOIN_FUNCTION_WORDS
+            or a in _EDIT_SHORT_WORDS or b in _EDIT_SHORT_WORDS):
+        return False
+    if (not a or not b or a[0] != b[0] or a.startswith(b) or b.startswith(a)
+            or abs(len(a) - len(b)) > 2 or min(len(a), len(b)) < 3):
+        return False
+    return _edit_distance(a, b) <= 2
+
+
+def _expand_contractions(keys):
+    out = []
+    for k in keys:
+        out.extend(_CONTRACTION_MAP.get(k, (k,)))
+    return out
+
+
+def _all_fillers(keys):
+    i = 0
+    while i < len(keys):
+        for n in (5, 3, 2):
+            if " ".join(keys[i:i + n]) in _EDIT_FILLER_PHRASES:
+                i += n
+                break
+        else:
+            if keys[i] in _EDIT_FILLERS or " ".join(keys[i:i + 1]) in _EDIT_FILLER_PHRASES:
+                i += 1
+            else:
+                return False
+    return True
+
+
+def _deletion_ok(run, before, after):
+    """May the model drop these raw words (keys), given the words around them?"""
+    if not run:
+        return True
+    if _all_fillers(run):
+        return True
+    # Restarts, judged with fillers set aside ("so the | the thing", "uh we
+    # need | we need a plan"): the same words said again right after or
+    # before. A reworded restart ("we should | we must") is NOT accepted: on
+    # words alone it looks exactly like a dropped hedge ("I think | I know").
+    core = [k for k in run if k not in _EDIT_FILLERS]
+    aft = [k for k in after if k not in _EDIT_FILLERS]
+    bef = [k for k in before if k not in _EDIT_FILLERS]
+    n = len(core)
+    if core and (aft[:n] == core or bef[-n:] == core):
+        return True
+    if (len(run) == 1 and len(run[0]) <= 3 and run[0] not in _EDIT_SHORT_WORDS
+            and after and after[0] != run[0] and after[0].startswith(run[0])):
+        return True  # a stutter fragment ("th | the", "wh | what")
+    n = len(run)
+    text = " " + " ".join(run) + " "
+    nxt = " " + " ".join(after[:3]) + " "
+    if n <= 40 and any(f" {c} " in text for c in _EDIT_RETRACTIONS):
+        return True
+    # A self-correction: the cue plus the words it supersedes ("monday
+    # actually no wait"), or a phrase dropped just before the cue. A lone
+    # "actually" is not a correction, just a word the speaker said.
+    if 2 <= n <= 12 and any(f" {c} " in text for c in _EDIT_CUES):
+        return True
+    if n <= 12 and any(nxt.startswith(f" {c} ") for c in _EDIT_CUES):
+        return True
+    return False
+
+
+def _replace_ok(r, c):
+    """May the model replace raw words r with c (both key lists)?"""
+    if "".join(r) == "".join(c):
+        return True  # compound joined, split or hyphenated
+    if len(r) == len(c) and all(_near_spelling(a, b) or frozenset((a, b)) in
+                                _EDIT_GRAMMAR_PAIRS for a, b in zip(r, c)):
+        return True
+    er, ec = _expand_contractions(r), _expand_contractions(c)
+    if len(er) == len(ec) and all(a == b or frozenset((a, b)) in _EDIT_GRAMMAR_PAIRS
+                                  for a, b in zip(er, ec)):
+        return True  # "gonna" -> "going to", "there's" -> "there are"
+    if (all(k in _EDIT_NUMBER_WORDS for k in r)
+            and any(ch.isdigit() for k in c for ch in k)
+            and all(any(ch.isdigit() for ch in k) or len(k) <= 3 for k in c)):
+        return True  # "ten percent" -> "10%", "three millimeters" -> "3 mm"
+    return False
+
+
+def _strip_trailing_punct(tok):
+    return tok.rstrip(".,;:!?")
+
+
+def _trailing_punct(tok):
+    return tok[len(tok.rstrip(".,;:!?")):]
+
+
+def _keep_speaker_words(raw, cleaned):
+    """Apply only the acceptable edits from the model's `cleaned` text to `raw`.
+
+    Both are split into whitespace tokens (newlines kept, so a spoken "new
+    paragraph" survives) and aligned on their letters/digits. Equal words take
+    the model's punctuation and capitals. Each differing run is judged:
+    deletions of fillers, restarts and self-corrected phrases stand; spelling,
+    agreement, digit and compound fixes stand; added words are dropped; any
+    other change is undone and the speaker's own words go back in place, with
+    the model's punctuation carried over.
+    """
+    import difflib
+    rt = _EDIT_TOKEN_RE.findall(raw)
+    ct = _EDIT_TOKEN_RE.findall(cleaned)
+    ri = [i for i, t in enumerate(rt) if _edit_key(t)]
+    ci = [j for j, t in enumerate(ct) if _edit_key(t)]
+    rk = [_edit_key(rt[i]) for i in ri]
+    ck = [_edit_key(ct[j]) for j in ci]
+    ops = difflib.SequenceMatcher(None, rk, ck, autojunk=False).get_opcodes()
+    out = []
+    cp = 0          # next cleaned token not yet emitted or skipped
+    undone = []
+
+    def emit_upto(pos):
+        # Tokens between words: paragraph breaks and punctuation-only tokens
+        # pass through; a dash the model added between words does not.
+        nonlocal cp
+        while cp < pos:
+            if not _EDIT_DASH_RE.match(ct[cp]):
+                out.append(ct[cp])
+            cp += 1
+
+    def emit_cleaned(j1, j2):
+        nonlocal cp
+        for j in range(j1, j2):
+            emit_upto(ci[j])
+            out.append(ct[ci[j]])
+            cp = ci[j] + 1
+
+    def restore(i1, i2, carry=""):
+        words = [rt[ri[i]] for i in range(i1, i2)]
+        if not words:
+            return
+        words = [_strip_trailing_punct(w) or w for w in words]
+        prev = out[-1] if out else ""
+        starts_sentence = not prev or prev.startswith("\n") or prev[-1:] in ".!?"
+        w0 = words[0]
+        if starts_sentence and w0[:1].islower():
+            words[0] = w0[:1].upper() + w0[1:]
+        elif (not starts_sentence and w0[:1].isupper() and not w0.isupper()
+              and w0.lower() in _JOIN_FUNCTION_WORDS):
+            # Capital only because Whisper had ended a sentence before it.
+            words[0] = w0[:1].lower() + w0[1:]
+        if carry:
+            words[-1] = words[-1] + carry
+        out.extend(words)
+        return starts_sentence
+
+    # After words are restored at a sentence start, the model's next word was
+    # its sentence opener; it gets its raw casing back ("Now please test it").
+    recase_next = False
+    for tag, i1, i2, j1, j2 in ops:
+        if j1 < len(ci):
+            emit_upto(ci[j1])
+        if tag == "equal":
+            first = len(out)  # ct[ci[j1]] lands here: emit_upto already ran
+            emit_cleaned(j1, j2)
+            if recase_next:
+                raw_tok, tok = rt[ri[i1]], out[first]
+                if raw_tok[:1].islower() and tok[:1].isupper():
+                    out[first] = tok[:1].lower() + tok[1:]
+                recase_next = False
+            continue
+        recase_next = False
+        r, c = rk[i1:i2], ck[j1:j2]
+        before, after = rk[max(0, i1 - 12):i1], rk[i2:i2 + 12]
+        if tag == "delete":
+            if _deletion_ok(r, before, after):
+                continue
+            # Content the model dropped goes back. If it continued the clause
+            # before it (no sentence end there in the raw text), move the
+            # clause's closing punctuation from the previous word to the end
+            # of the restored words.
+            carry = ""
+            prev_raw_end = rt[ri[i1 - 1]][-1:] in ".!?" if i1 > 0 else True
+            if out and not prev_raw_end:
+                carry = _trailing_punct(out[-1])
+                if carry:
+                    out[-1] = out[-1][:-len(carry)]
+            recase_next = restore(i1, i2, carry=carry) and not carry
+            undone.append(("kept", " ".join(r)))
+            continue
+        if tag == "insert":
+            # Words the speaker never said. (Wispr adds a small word now and
+            # then, but the model adds far more, and on the archive keeping
+            # them lowered agreement.)
+            last = ct[ci[j2 - 1]]
+            cp = ci[j2 - 1] + 1
+            carry = _trailing_punct(last)
+            if carry and out and not _trailing_punct(out[-1]):
+                out[-1] = out[-1] + carry
+            undone.append(("dropped", " ".join(c)))
+            continue
+        # replace
+        core = [k for k in r if k not in _EDIT_FILLERS]
+        if _replace_ok(r, c) or (core and core != r and _replace_ok(core, c)):
+            emit_cleaned(j1, j2)
+            continue
+        last = ct[ci[j2 - 1]]
+        cp = ci[j2 - 1] + 1
+        restore(i1, i2, carry=_trailing_punct(last))
+        undone.append(("reworded", f"{' '.join(c)} -> {' '.join(r)}"))
+    emit_upto(len(ct))
+
+    # Rebuild the text: newline tokens join without spaces around them.
+    text = ""
+    for tok in out:
+        if tok.startswith("\n"):
+            text = text.rstrip(" ") + tok
+        elif not text or text.endswith("\n"):
+            text += tok
+        else:
+            text += " " + tok
+    # A restored word opening a sentence gets its capital; typographic quotes
+    # go back to the straight ones Whisper (and Wispr) type.
+    text = re.sub(r"(^|[.!?]\s+|\n)([a-z])",
+                  lambda m: m.group(1) + m.group(2).upper(), text)
+    text = text.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
+    if undone:
+        log(">> Edit-only cleanup undid " + "; ".join(
+            f"{kind} {what!r}" for kind, what in undone[:6])
+            + (f" (+{len(undone) - 6} more)" if len(undone) > 6 else ""))
+    return text.strip()
+
+
 def llm_format(text):
     """Optional Wispr-style cleanup: polish the raw transcript with an LLM.
 
@@ -1549,7 +1898,10 @@ def llm_format(text):
                     f"'{LLM_CHAIN[i]}': {cleaned[:80]!r})")
                 continue
             log(f">> LLM cleanup ({LLM_CHAIN[i]}) in {time.monotonic() - t0:.2f}s")
-            return _rejoin_split_words(text, cleaned)
+            cleaned = _rejoin_split_words(text, cleaned)
+            if LLM_STYLE != "rewrite":
+                cleaned = _keep_speaker_words(text, cleaned)
+            return cleaned
         if not any(outcomes.values()):
             log(f">> LLM cleanup: no backend answered within {budget:.1f}s; "
                 "using raw text")
