@@ -206,6 +206,24 @@ Names, jargon, and product names that Whisper mishears go in `dictionary.json`:
 
 Edit the file and restart the app to reload.
 
+## Shadow mode: compare Vox with Wispr Flow
+
+Keep dictating with [Wispr Flow](https://wisprflow.ai) and let Vox run alongside it. Wispr Flow (1.6.8xx and later) stores each dictation's audio in its local history database. `shadow.py` plays that same audio through Vox and records what Vox would have pasted. You get a side-by-side comparison of the two on identical speech without dictating twice.
+
+```powershell
+.\.venv\Scripts\python.exe shadow.py run      # archive new Wispr dictations, replay them, write the report
+.\.venv\Scripts\python.exe shadow.py status   # what is archived and how much has been replayed
+.\.venv\Scripts\python.exe shadow.py report --open
+```
+
+- **Ingest:** copies each new Wispr dictation (its WAV, Wispr's raw ASR, formatted and pasted text, and your later edits) into `%LOCALAPPDATA%\vox\shadow` (`~/.local/state/vox/shadow` elsewhere; override with `VOX_SHADOW_DIR`). Wispr's database is only ever opened read-only.
+- **Replay:** runs Vox's real release path, `stop_and_transcribe()`. That includes segment prefetch fed at the live block and poll cadence, the echo guard, the optional cleanup pass and the dictionary. Pasting, the HUD, the tray and the daily transcript file are all stubbed out. Nothing is typed anywhere.
+- **Variants:** `variants.json` in the shadow folder lists which Vox to replay: a checkout directory plus environment overrides. You can compare "the Vox running on this PC" with the latest code, or a different cleanup model, on the same audio. Results are keyed by a hash of `dictation.py` + `dictionary.json` + env. After you change Vox, the corpus is replayed again, newest first, `--max` per run. So the growing Wispr corpus doubles as a regression suite.
+- **Report:** `report.html` next to the archive. It shows word-level diffs against Wispr's pasted text, sorts each difference into a kind (names, misheard words, missing phrases, fillers, false starts, small words, numbers, spacing), lists recurring misses and dictionary suggestions, and plays each clip. Wispr is the reference, not the truth, so the report also flags where you corrected Wispr afterwards.
+- **Schedule (Windows):** a Task Scheduler entry that runs `pythonw shadow.py run` every 15 minutes keeps the archive current. The run exits quickly when nothing is new.
+
+Everything the shadow writes is personal speech, and none of it belongs in this repo.
+
 ## Troubleshooting
 
 ### No text appears (Linux)
