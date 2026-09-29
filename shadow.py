@@ -412,17 +412,21 @@ def load_variants():
 
 
 def _git_sha(vox_dir):
+    # CREATE_NO_WINDOW: "Vox Shadow" runs under pythonw, so each git call
+    # would otherwise flash a console window every 15 minutes.
+    flags = 0x08000000 if IS_WINDOWS else 0
     try:
         r = subprocess.run(["git", "-C", vox_dir, "rev-parse", "--short=7",
                             "HEAD"], capture_output=True, text=True,
-                           timeout=10)
+                           timeout=10, creationflags=flags)
         sha = r.stdout.strip()
         if not sha:
             return None
         dirty = subprocess.run(
             ["git", "-C", vox_dir, "status", "--porcelain", "--",
              "dictation.py", "dictionary.json"],
-            capture_output=True, text=True, timeout=10).stdout.strip()
+            capture_output=True, text=True, timeout=10,
+            creationflags=flags).stdout.strip()
         return sha + ("+dirty" if dirty else "")
     except Exception:
         return None
