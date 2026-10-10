@@ -1093,6 +1093,28 @@ def collapse_restarts(text):
     return text
 
 
+# Sentence-boundary rules for edit mode. Measured on Michael's Wispr shadow
+# archive: Whisper ends a sentence at every pause, so raw Vox had ~20% more
+# sentence ends than Wispr, and the 4B cleanup model on the generic "merge
+# fragments" sentence alone made it WORSE (exp4b). Wispr's formatter, on its
+# own same-words before/after pairs, mostly turns ". So"/". And"/". Because"/
+# ". Which" into a comma or nothing and pulls a trailing question mark over a
+# joined clause; these rules say exactly that, and _BOUNDARY_SHOTS show it.
+_BOUNDARY_RULES = (
+    "Sentence boundaries: the transcriber puts a period wherever the speaker "
+    "paused, so fix them. A clause that only continues the previous thought "
+    "- it starts with and, but, so, or, because, which, where, like or "
+    "especially, or cannot stand on its own - joins the previous sentence "
+    "with a comma or no mark, never a period. But two complete sentences, "
+    "each with its own subject and verb, stay two sentences: never join them "
+    "with a comma, and split a run-on where a new sentence clearly starts. A "
+    "question ends with a question mark, also when a joined clause follows "
+    "it. A transcript that is only a fragment rather than a full sentence (a "
+    "list item, a title, a phrase continuing earlier text) gets no final "
+    "period. Numbers stay exactly as said, as digits: never add a minus sign, "
+    "hyphen or # to a number (Heading 4 stays Heading 4). ")
+
+
 def _cleanup_system_prompt():
     """Shared instruction for both the local and Anthropic cleanup backends.
 
@@ -1127,7 +1149,7 @@ def _cleanup_system_prompt():
             "changes allowed are punctuation, capitalization, removing fillers, "
             "stutters, false starts and self-corrected phrases, fixing an obvious "
             "misspelling or misheard homophone, writing numbers as digits, and "
-            "breaking paragraphs for spoken commands. ")
+            "breaking paragraphs for spoken commands. " + _BOUNDARY_RULES)
     return (
         "You are a text-normalization function, not an assistant. Return ONLY a "
         "cleaned version of the input transcript: fix capitalization, punctuation, "
@@ -1185,11 +1207,59 @@ _CLEANUP_SHOTS = [
      "Okay, dictation is really messing up now."),
 ]
 
+# Edit mode only: sentence-boundary pairs mined from Michael's own Wispr Flow
+# history (2026-10-09 backup, History.asrText -> formattedText, same words,
+# different punctuation). Mostly joins (". So" -> ", so"; "? Because" -> one
+# question), plus pairs where Wispr KEPT or ADDED a boundary, so the model
+# learns to judge rather than merge everything. The last pair is the
+# reported "Heading -4" dictation: a trailing number stays a bare digit.
+# The pairs after it keep two real sentences apart (no comma splice) and
+# leave a bare fragment without a final period, as Wispr does. All pairs
+# predate the 2026-09-16+ shadow corpus they are measured on.
+_BOUNDARY_SHOTS = [
+    ("I'm running Claude Code in Auto Mode. So it should be able to handle all these things now.",
+     "I'm running Claude Code in Auto Mode, so it should be able to handle all these things now."),
+    ("Can you check git now? Because I think I have it up there.",
+     "Can you check git now because I think I have it up there?"),
+    ("It's been edited by Gemini, which really sucks. So feel free to fully rewrite this and reshape it.",
+     "It's been edited by Gemini, which really sucks, so feel free to fully rewrite this and reshape it."),
+    ("Okay, I got it on, there was just a developer toggle switch in settings.",
+     "Okay, I got it on. There was just a developer toggle switch in settings."),
+    ("Yes, can you make the vision memo I was just working on part of my new data room? Which would be a page in that new data room?",
+     "Yes, can you make the vision memo I was just working on part of my new data room, which would be a page in that new data room?"),
+    ("The glasses did not drop off USB. I had taken them off and was wearing them. And now I just reconnected them. Try again.",
+     "The glasses did not drop off USB. I had taken them off and was wearing them, and now I just reconnected them. Try again."),
+    ("Can you format this document so that it can be a rolling list of notes from the call",
+     "Can you format this document so that it can be a rolling list of notes from the call?"),
+    ("Obviously I'm not working on anything electron microscopy related. Where Eon is doing expansion microscopy and we're pretty fast at it.",
+     "Obviously I'm not working on anything electron microscopy related, where Eon is doing expansion microscopy and we're pretty fast at it."),
+    ("This is looking good. Can you remove some of the AI-isms from it? Like em dashes.",
+     "This is looking good. Can you remove some of the AI-isms from it, like em dashes?"),
+    ("It's not immediately exiting out of the app anymore. But sometimes it does if I'm on video and do a single tap.",
+     "It's not immediately exiting out of the app anymore, but sometimes it does if I'm on video and do a single tap."),
+    ("If you have an Eon email address you should be able to see my calendar otherwise just book something here",
+     "If you have an Eon email address, you should be able to see my calendar. Otherwise just book something here."),
+    ("Great. And is this visible on my data room that's on Cloudflare as well?",
+     "Great, and is this visible on my data room that's on Cloudflare as well?"),
+    ("Can you check over the work that 4.8 just did? And confirm it's a good plan?",
+     "Can you check over the work that 4.8 just did and confirm it's a good plan?"),
+    ("Okay, now it should not show any Heading 4",
+     "Okay, now it should not show any Heading 4."),
+    ("Hey, this could be great, I haven't had enough time to go through your proposal yet.",
+     "Hey, this could be great. I haven't had enough time to go through your proposal yet."),
+    ("I make a new workspace I transfer tabs over and then the issue just happens again sometime kind of randomly it's been happening every single day now",
+     "I make a new workspace. I transfer tabs over, and then the issue just happens again, sometime kind of randomly. It's been happening every single day now."),
+    ("In exchange for early looks at some of the data.",
+     "In exchange for early looks at some of the data"),
+    ("And greyscale.", "And greyscale"),
+]
+
 
 def _cleanup_fewshot():
     """Few-shot exchanges as chat messages, shared by both backends."""
     msgs = []
-    for user, assistant in _CLEANUP_SHOTS:
+    shots = _CLEANUP_SHOTS + (_BOUNDARY_SHOTS if LLM_STYLE != "rewrite" else [])
+    for user, assistant in shots:
         msgs.append({"role": "user", "content": user})
         msgs.append({"role": "assistant", "content": assistant})
     return msgs
@@ -1539,6 +1609,7 @@ def _rejoin_split_words(raw, cleaned):
 _EDIT_TOKEN_RE = re.compile(r"\n+|[—–]|[^\s—–]+")
 _EDIT_DASH_RE = re.compile(r"^[—–-]+$")
 _EDIT_KEY_RE = re.compile(r"[a-z0-9']+")
+_EDIT_SIGNED_NUM_RE = re.compile(r"^[\"'(\[]*([-+−–#]+)(?=\d)")
 # Only the fillers Wispr itself drops (1,746 before/after pairs): "okay",
 # "yeah", "actually", "just", "really" are kept, as Wispr keeps them.
 _EDIT_FILLERS = {
@@ -1677,7 +1748,10 @@ def _deletion_ok(run, before, after):
 def _replace_ok(r, c):
     """May the model replace raw words r with c (both key lists)?"""
     if "".join(r) == "".join(c):
-        return True  # compound joined, split or hyphenated
+        # Compound joined, split or hyphenated - but a word is never glued
+        # to a number the speaker said apart ("Heading 4" -> "Heading-4").
+        return not any(a.isalpha() and b.isdigit() or a.isdigit() and b.isalpha()
+                       for a, b in zip(r, r[1:]))
     if len(r) == len(c) and all(_near_spelling(a, b) or frozenset((a, b)) in
                                 _EDIT_GRAMMAR_PAIRS for a, b in zip(r, c)):
         return True
@@ -1767,6 +1841,13 @@ def _keep_speaker_words(raw, cleaned):
         if tag == "equal":
             first = len(out)  # ct[ci[j1]] lands here: emit_upto already ran
             emit_cleaned(j1, j2)
+            # Same word, but the model may have prefixed a number with a sign
+            # or # the speaker never said ("Heading 4" -> "Heading -4").
+            for k in range(first, len(out)):
+                m = _EDIT_SIGNED_NUM_RE.match(out[k])
+                if m and not _EDIT_SIGNED_NUM_RE.match(rt[ri[i1 + sum(
+                        1 for t in out[first:k] if _edit_key(t))]]):
+                    out[k] = out[k][:m.start(1)] + out[k][m.end(1):]
             if recase_next:
                 raw_tok, tok = rt[ri[i1]], out[first]
                 if raw_tok[:1].islower() and tok[:1].isupper():
