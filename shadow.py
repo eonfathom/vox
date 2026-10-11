@@ -456,7 +456,8 @@ def config_key(variant):
     h.update(json.dumps(variant.get("env", {}), sort_keys=True).encode())
     # Per-machine files change behavior too, but only count when present, so
     # adding this check did not invalidate earlier results.
-    for name in ("dictionary.local.json", "settings.local.json"):
+    for name in ("dictionary.local.json", "settings.local.json",
+                 "dictionary.learned.json"):
         p = os.path.join(variant["vox_dir"], name)
         if os.path.exists(p):
             with open(p, "rb") as f:

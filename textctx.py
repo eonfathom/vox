@@ -151,3 +151,61 @@ def read(max_before=64, max_after=16, timeout=0.25):
     t.start()
     t.join(timeout)
     return result[0] if result else None
+
+
+# --- Whole-element access for learn.py (edit observation) ---------------------
+# Called ONLY from learn.Watcher's own daemon thread, never from the dictation
+# path, and deliberately without _lock: if a target app hangs this call, it
+# stalls learning alone, while read() above keeps its own deadline.
+_UIA_TEXT_PATTERN_ID = 10014  # UIA_TextPatternId
+_UIA_VALUE_PATTERN_ID = 10002  # UIA_ValuePatternId (plain inputs, fallback)
+
+
+def _pattern(element, pattern_id):
+    """The element's pattern object, or None (comtypes hands back a NULL
+    pointer, not None, for an unsupported pattern)."""
+    raw = element.GetCurrentPattern(pattern_id)
+    return raw if raw else None
+
+
+def focused_text_element():
+    """The focused element if it exposes its text (TextPattern, else
+    ValuePattern) and is not a password field, else None."""
+    if not (IS_WINDOWS and ENABLED) or _dead:
+        return None
+    try:
+        import comtypes
+        try:
+            comtypes.CoInitialize()
+        except OSError:
+            pass
+        uia = _get_uia()
+        if uia is None:
+            return None
+        el = uia.GetFocusedElement()
+        if not el or el.CurrentIsPassword:
+            return None
+        if (_pattern(el, _UIA_TEXT_PATTERN_ID) is None
+                and _pattern(el, _UIA_VALUE_PATTERN_ID) is None):
+            return None
+        return el
+    except Exception:
+        return None
+
+
+def element_text(element, max_chars=100000):
+    """The element's current text (up to max_chars), or None."""
+    try:
+        from comtypes.gen.UIAutomationClient import (
+            IUIAutomationTextPattern, IUIAutomationValuePattern)
+        raw = _pattern(element, _UIA_TEXT_PATTERN_ID)
+        if raw is not None:
+            pattern = raw.QueryInterface(IUIAutomationTextPattern)
+            return pattern.DocumentRange.GetText(max_chars)
+        raw = _pattern(element, _UIA_VALUE_PATTERN_ID)
+        if raw is not None:
+            value = raw.QueryInterface(IUIAutomationValuePattern).CurrentValue
+            return (value or "")[:max_chars]
+        return None
+    except Exception:
+        return None
