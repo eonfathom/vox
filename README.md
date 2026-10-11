@@ -119,6 +119,9 @@ Configuration is via environment variables.
 | `VOX_DEVICE` | auto | Auto-detected: `cuda` if a GPU is present, else `cpu`. Override with `cuda`/`cpu`. |
 | `VOX_COMPUTE` | auto | `float16` on GPU, `int8` on CPU. Override with `float16`/`int8`/`float32`. |
 | `VOX_DICT` | `dictionary.json` | Path to the personal dictionary file |
+| `VOX_LEARN` | `1` | Learn spellings from your corrections to Vox's pastes (see *Learning from your corrections*). `0` (or `"learn": false` in `settings.local.json`) turns off both the watching and the learned vocabulary |
+| `VOX_LEARNED_HOTWORDS` | `0` | How many of the most frequent learned words also become Whisper hotwords (more hotwords measured worse; replay before raising) |
+| `VOX_LEARN_FUZZY` | `1` | Fix near-spellings of learned words after the cleanup pass. `0` to disable |
 | `VOX_STRIP_PHANTOMS` | `1` | Strip hallucinated trailing hotword echoes from the transcript. Set `0` to disable |
 | `VOX_RESTARTS` | `1` | Collapse verbatim sentence restarts ("we need the, we need the plan" → "we need the plan") without an LLM. `0` to disable |
 | `VOX_SMARTCASE` | `1` | Insertion-aware casing (Windows): reads the text around the caret (UI Automation, app-dependent; falls back to vox's own last paste) so dictating mid-sentence doesn't start with a capital, glue words together, or split the sentence with a period. `0` to disable |
@@ -211,6 +214,27 @@ Names, jargon, and product names that Whisper mishears go in `dictionary.json`:
 **Personal names stay local:** put them in `dictionary.local.json`, next to `dictionary.json` and in the same format. Git ignores it. Its hotwords are added to the shared ones, and its corrections win over them. `VOX_DICT_LOCAL` points somewhere else. Use it for the names of people you talk about, so they never end up in a public repo.
 
 Edit the file and restart the app to reload.
+
+### Learning from your corrections
+
+Like Wispr Flow, Vox learns spellings from the edits you make to its own pastes (Windows; `learn.py`):
+
+- **Watch.** After a paste, Vox reads the same text box again through UI Automation, about 20 s later or when your next dictation starts, whichever comes first. It diffs what it pasted against what is there now. Only correction-shaped edits count: a one- or two-word swap where the new spelling sounds like or nearly matches the old (`Zavier` → `Xavier`, `poles` → `polls`). Rewrites, insertions and deletions are ignored. Each correction is appended to `%LOCALAPPDATA%\vox\learned-candidates.jsonl` with three words of context on each side. The text box itself is never stored. Password fields are skipped.
+- **Promote.** A correction seen twice is promoted to `dictionary.learned.json` (next to `dictionary.json`, machine-local, git-ignored). That means the same pair twice, or the same word reached from two different mishearings. Vox logs a loud `LEARNED NEW WORD` line when it happens.
+- **Apply.** Learned words stay out of Whisper's hotwords, because changing the hotword list made recognition worse when measured. Instead:
+  - every learned word joins the cleanup model's list of reference spellings;
+  - mishearings that are not real words become corrections;
+  - a fuzzy pass after the cleanup fixes a near-spelling of a learned word, but only when exactly one learned word matches and the transcript word is not itself a real word (`common_words.txt`).
+  - None become Whisper hotwords by default. On the shadow corpus, 10 extra hotwords re-rolled Whisper's decoding and lost word agreement. `VOX_LEARNED_HOTWORDS=N` adds the top N.
+- **Protected.** Spellings Vox produces on purpose are never learned away. That covers your hotwords, the results of your corrections, and anything listed under `"protect"` in a dictionary file. For example, `ether` → `Aethyr` stays even if you once type `ether` over it.
+
+```
+python dictation.py --learned          # list what Vox has learned
+python dictation.py --forget Xavier    # remove a word (and never re-learn it)
+python tools/import_wispr_dictionary.py --dry-run   # seed from Wispr Flow's dictionary (read-only)
+```
+
+Turn it all off with `VOX_LEARN=0` or `"learn": false` in `settings.local.json`. Vox then neither watches your edits nor applies learned words.
 
 ## Shadow mode: compare Vox with Wispr Flow
 

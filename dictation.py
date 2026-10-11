@@ -39,6 +39,8 @@ import wave
 import numpy as np
 import sounddevice as sd
 
+import learn  # vocabulary learned from your own corrections
+
 IS_WINDOWS = sys.platform == "win32"
 
 # --- Platform-specific imports ---
@@ -485,6 +487,29 @@ DICT_PATH = os.environ.get(
 DICT_LOCAL_PATH = os.environ.get(
     "VOX_DICT_LOCAL", os.path.join(SCRIPT_DIR, "dictionary.local.json")
 )
+# Vocabulary learned from your own corrections (learn.py; machine-local,
+# git-ignored). VOX_LEARN=0, or "learn": false in settings.local.json, turns
+# learning off completely: no edit observation and no learned vocabulary
+# applied - Vox then behaves exactly as without this feature.
+DICT_LEARNED_PATH = os.environ.get(
+    "VOX_DICT_LEARNED", os.path.join(SCRIPT_DIR, "dictionary.learned.json")
+)
+LEARN = _setting("VOX_LEARN", "learn", "1").strip().lower() not in (
+    "0", "false", "off", "no")
+# How many of the most frequent learned terms also become Whisper hotwords.
+# Default 0: every hotword list change re-rolls Whisper's decoding. 44 extra
+# names cost 0.6 points of word agreement (2026-09), and the 9 most frequent
+# learned terms cost 0.18 points on the 723-clip shadow corpus (2026-10-10:
+# a one-word clip decoded as the prompt, a protected name respelled), while
+# the same vocabulary via the cleanup reference list + corrections + fuzzy
+# fix cost nothing. Raise it only with a shadow replay to back it.
+LEARNED_HOTWORDS_N = int(os.environ.get("VOX_LEARNED_HOTWORDS", "0"))
+# The post-cleanup fuzzy fixer for near-spellings of learned terms.
+LEARN_FUZZY = os.environ.get("VOX_LEARN_FUZZY", "1").strip().lower() not in (
+    "0", "false", "off", "no")
+# Seconds after a paste before the text box is re-read for your edits (the
+# start of the next dictation re-reads it sooner).
+LEARN_DELAY_SEC = float(os.environ.get("VOX_LEARN_DELAY", "20"))
 
 # Prompt that encourages proper punctuation from whisper
 INITIAL_PROMPT = "Hello, how are you? I'm doing well. Let's discuss the project."
@@ -873,7 +898,7 @@ MODEL_SIZE = os.environ.get("VOX_MODEL") or (
 
 
 # --- Personal dictionary ------------------------------------------------------
-def load_dictionary():
+def _load_base_dictionary():
     """Load hotwords + corrections from dictionary.json (if present), then from
     the machine-local overlay dictionary.local.json next to it.
 
@@ -886,8 +911,11 @@ def load_dictionary():
     on your machine instead of in this (public) repo: its hotwords are
     appended (a term already listed, in any case, is skipped) and its
     corrections override the shared ones. VOX_DICT_LOCAL moves it.
+
+    protect     : extra spellings Vox must never "learn" away or fuzzy-fix
+                  (hotwords and correction results are protected already).
     """
-    hotwords, corrections = [], {}
+    hotwords, corrections, protect = [], {}, []
     seen = set()
     for path in (DICT_PATH, DICT_LOCAL_PATH):
         try:
@@ -905,10 +933,41 @@ def load_dictionary():
         for wrong, right in (data.get("corrections") or {}).items():
             if isinstance(wrong, str) and isinstance(right, str) and wrong.strip():
                 corrections[wrong] = right
-    return hotwords, corrections
+        protect += [p for p in data.get("protect") or [] if isinstance(p, str)]
+    return hotwords, corrections, protect
 
 
-HOTWORDS, CORRECTIONS = load_dictionary()
+def load_dictionary():
+    """The working dictionary: the base files plus learned vocabulary.
+
+    Returns (hotwords, corrections, learned_view, protected). The learned part
+    (dictionary.learned.json, see learn.py) adds: its top LEARNED_HOTWORDS_N
+    terms as Whisper hotwords; every term to the cleanup model's reference
+    spellings; heard forms that are not real words as corrections (the base
+    dictionary's corrections win any conflict); and the fuzzy-fix targets.
+    protected = the spellings Vox produces on purpose (hotwords, correction
+    results, the "protect" lists), which learning never undoes.
+    """
+    hotwords, corrections, protect = _load_base_dictionary()
+    protected = set(protect) | set(corrections.values())
+    for h in hotwords:
+        protected.add(h)
+        protected.update(h.split())
+    view = {"hotwords": [], "corrections": {}, "reference": [], "fuzzy": [],
+            "n": 0}
+    if LEARN:
+        try:
+            view = learn.learned_view(learn.load_learned(DICT_LEARNED_PATH),
+                                      hotwords, corrections, protected,
+                                      LEARNED_HOTWORDS_N)
+        except Exception as e:
+            log(f"WARNING: could not apply learned vocabulary: {e}")
+    return (hotwords + view["hotwords"], {**view["corrections"], **corrections},
+            view, protected)
+
+
+HOTWORDS, CORRECTIONS, LEARNED, PROTECTED = load_dictionary()
+_BASE_CORRECTION_KEYS = set(_load_base_dictionary()[1])
 _CORRECTION_RES = [
     (re.compile(r"\b" + re.escape(wrong) + r"\b", re.IGNORECASE), right)
     for wrong, right in CORRECTIONS.items()
@@ -1124,7 +1183,10 @@ def _cleanup_system_prompt():
     reinforced by the few-shot pairs below (which matter more than the prose).
     """
     ref = ""
-    if HOTWORDS:
+    hot = {h.lower() for h in HOTWORDS}
+    reference = HOTWORDS + [t for t in LEARNED["reference"]
+                            if t.lower() not in hot]
+    if reference:
         # Small models re-case unfamiliar brand terms (rokid -> ROKID, eon -> EON).
         # Give them the canonical spellings to preserve WHERE the term already
         # appears - not to insert. Not fully reliable on a 1.5B (deterministic
@@ -1133,7 +1195,7 @@ def _cleanup_system_prompt():
         ref = (
             " Use these exact spellings, with this capitalization, wherever the "
             "corresponding term already appears - never insert them elsewhere: "
-            + ", ".join(HOTWORDS) + "."
+            + ", ".join(reference) + "."
         )
     if LLM_STYLE == "rewrite":
         style = (
@@ -1755,6 +1817,9 @@ def _replace_ok(r, c):
     if len(r) == len(c) and all(_near_spelling(a, b) or frozenset((a, b)) in
                                 _EDIT_GRAMMAR_PAIRS for a, b in zip(r, c)):
         return True
+    if (LEARN and len(c) == 1 and 1 <= len(r) <= 2 and c[0] in _reference_keys()
+            and learn.sounds_alike("".join(r), c[0])):
+        return True  # a learned/dictionary spelling of the same sound
     er, ec = _expand_contractions(r), _expand_contractions(c)
     if len(er) == len(ec) and all(a == b or frozenset((a, b)) in _EDIT_GRAMMAR_PAIRS
                                   for a, b in zip(er, ec)):
@@ -1764,6 +1829,11 @@ def _replace_ok(r, c):
             and all(any(ch.isdigit() for ch in k) or len(k) <= 3 for k in c)):
         return True  # "ten percent" -> "10%", "three millimeters" -> "3 mm"
     return False
+
+
+def _reference_keys():
+    return {_edit_key(t) for t in HOTWORDS + LEARNED["reference"]
+            if " " not in t}
 
 
 def _strip_trailing_punct(tok):
@@ -2024,7 +2094,120 @@ def post_process(text):
     text = strip_trailing_phantoms(text)     # 4. drop hallucinated trailing hotwords
     text = llm_format(text)                  # 5. optional LLM cleanup (off by default)
     text = apply_corrections(text)           # 6. personal-dictionary corrections (final say)
+    text = fuzzy_fix_learned(text)           # 7. near-spellings of learned terms
     return text
+
+
+def fuzzy_fix_learned(text):
+    """learn.fuzzy_correct with the live learned terms (VOX_LEARN_FUZZY=0 off)."""
+    if not (LEARN and LEARN_FUZZY and LEARNED["fuzzy"]) or not text:
+        return text
+    try:
+        out, changes = learn.fuzzy_correct(
+            text, LEARNED["fuzzy"],
+            PROTECTED | set(CORRECTIONS) - set(LEARNED["fuzzy"]))
+    except Exception as e:
+        log(f">> Learned fix skipped ({e.__class__.__name__}: {e})")
+        return text
+    for old, new in changes:
+        log(f">> Learned fix: {old!r} -> {new!r}")
+    return out
+
+
+# --- Learning from your corrections (learn.py) ---------------------------------
+def _learn_candidates_path():
+    return os.path.join(_state_dir(), "learned-candidates.jsonl")
+
+
+def _reload_learned():
+    """Pick up a new dictionary.learned.json: corrections, reference spellings
+    and fuzzy targets now; Whisper hotwords at the next start."""
+    global CORRECTIONS, LEARNED, PROTECTED, _CORRECTION_RES
+    _hot, corrections, learned, protected = load_dictionary()
+    CORRECTIONS, LEARNED, PROTECTED = corrections, learned, protected
+    _CORRECTION_RES = [
+        (re.compile(r"\b" + re.escape(wrong) + r"\b", re.IGNORECASE), right)
+        for wrong, right in CORRECTIONS.items()
+    ]
+
+
+def _on_learn_candidates(cands):
+    """Watcher callback (learn thread): log, append, promote."""
+    for c in cands:
+        log(f">> Learn: you corrected {c['heard']!r} -> {c['corrected']!r}"
+            f" ({c.get('app') or '?'})")
+    path = _learn_candidates_path()
+    learn.append_candidates(path, cands)
+    learned = learn.load_learned(DICT_LEARNED_PATH)
+    dropped = []
+    new = learn.promote(learn.read_candidates(path), learned,
+                        PROTECTED, _BASE_CORRECTION_KEYS, superseded=dropped)
+    before = learn.load_learned(DICT_LEARNED_PATH)
+    if new or learned["terms"] != before["terms"]:
+        learn.save_learned(DICT_LEARNED_PATH, learned)
+        for old, by in dropped:
+            log(f">> Learn: {old!r} superseded by your newer correction to {by!r}")
+        for term in new:
+            t = next(x for x in learned["terms"] if x["term"] == term)
+            log(f">> ***** LEARNED NEW WORD: {term!r} (heard as "
+                f"{', '.join(repr(h) for h in t['heard'])}; seen {t['count']}x)"
+                f" -> {DICT_LEARNED_PATH}")
+        _reload_learned()
+
+
+_learn_watcher = None
+
+
+def _learn_note_paste(text):
+    """After a paste: watch the text box for the user's corrections."""
+    global _learn_watcher
+    if not (LEARN and IS_WINDOWS and textctx.ENABLED):
+        return
+    try:
+        if _learn_watcher is None:
+            _learn_watcher = learn.Watcher(
+                textctx, _on_learn_candidates, log=log, delay=LEARN_DELAY_SEC)
+        _learn_watcher.protected = set(PROTECTED)
+        _learn_watcher.blocked = set(_BASE_CORRECTION_KEYS)
+        _learn_watcher.note_paste(text)
+    except Exception:
+        pass  # learning is optional; a dictation never pays for it
+
+
+def _learn_dictation_started():
+    try:
+        if _learn_watcher is not None:
+            _learn_watcher.dictation_started()
+    except Exception:
+        pass
+
+
+def learned_cli(argv):
+    """`dictation.py --learned` lists; `dictation.py --forget <term>` removes."""
+    data = learn.load_learned(DICT_LEARNED_PATH)
+    if "--forget" in argv:
+        i = argv.index("--forget")
+        term = " ".join(argv[i + 1:]).strip()
+        if not term:
+            print("usage: dictation.py --forget <term>")
+            return False
+        n = learn.forget(data, term)
+        learn.save_learned(DICT_LEARNED_PATH, data)
+        print(f"Forgot {term!r} ({n} entr{'y' if n == 1 else 'ies'} removed;"
+              " it will not be re-learned). Restart Vox to apply.")
+        return True
+    print(f"Learned vocabulary: {DICT_LEARNED_PATH}"
+          f" (learning {'ON' if LEARN else 'OFF'})")
+    if not data["terms"]:
+        print("  (none yet)")
+    for t in sorted(data["terms"], key=lambda t: -t["count"]):
+        tag = " [Whisper hotword]" if t["term"] in LEARNED["hotwords"] else ""
+        heard = ", ".join(t["heard"]) or "-"
+        print(f"  {t['term']:<24} x{t['count']:<4} heard: {heard}{tag}")
+    if data["forgotten"]:
+        print("  forgotten: " + ", ".join(data["forgotten"]))
+    print(f"Candidates log: {_learn_candidates_path()}")
+    return True
 
 
 # --- Insertion-aware casing (Wispr-style) -------------------------------------
@@ -2897,6 +3080,7 @@ def start_recording():
 
     overflow_count = 0
     target_window = get_active_window()
+    _learn_dictation_started()  # re-read the last paste for corrections
     try:
         _ensure_stream()  # fast no-op when healthy; self-repair if it died
     except Exception as e:
@@ -3141,6 +3325,7 @@ def stop_and_transcribe():
         log(f">> Result: {text}")
         type_text(text, target_window, trailing_space=trailing)
         _note_paste(text)
+        _learn_note_paste(text)
         hud.done(words=len(text.split()), secs=duration,
                  tokens=last_llm_tokens, gen=hud_gen)
         tray.idle()
@@ -3826,6 +4011,10 @@ def main():
     if HOTWORDS or CORRECTIONS:
         log(f"  Dictionary: {len(HOTWORDS)} hotwords, "
             f"{len(CORRECTIONS)} corrections")
+    log(f"  Learning: {'on' if LEARN else 'off (VOX_LEARN=0)'}; "
+        f"{LEARNED['n']} learned terms"
+        f" ({len(LEARNED['hotwords'])} as hotwords, "
+        f"{len(LEARNED['corrections'])} corrections)")
     if TRANSCRIPT_DIR:
         log(f"  Transcript dir: {TRANSCRIPT_DIR}")
 
@@ -3867,6 +4056,8 @@ def main():
 
 
 if __name__ == "__main__":
+    if "--learned" in sys.argv or "--forget" in sys.argv:
+        sys.exit(0 if learned_cli(sys.argv) else 1)
     if "--capture-hotkey" in sys.argv:
         # Standalone chord-capture: no model load, just record + save a hotkey
         # for this machine (e.g. to try Ctrl+Fn), then exit.

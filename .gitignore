@@ -15,3 +15,7 @@ assets/vox-logo.ico
 
 # Machine-local dictionary additions (personal names) - never committed.
 dictionary.local.json
+
+# Vocabulary learned from your own corrections (learn.py) - machine-local.
+dictionary.learned.json
+dictionary.learned.json.tmp
