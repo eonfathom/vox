@@ -518,13 +518,16 @@ TRANSCRIPT_DIR_SOURCE = _setting_source("VOX_TRANSCRIPT_DIR", "transcript_dir")
 SAVE_AUDIO = os.environ.get("VOX_SAVE_AUDIO", "1")
 AUDIO_KEEP_DEFAULT = 20
 _KEEP_ALL_WORDS = ("0", "all", "keep all", "keep-all", "keep_all",
-                   "unlimited", "forever", "every", "inf")
+                   "unlimited", "forever", "every", "everything", "inf",
+                   "true", "yes")
 
 
 def parse_audio_keep(value, default=AUDIO_KEEP_DEFAULT):
     """(keep, problem): keep is the newest-N count to keep, or None for keep
-    every recording; problem is "" or why the value was not understood (the
-    default is used then, as the old int() would have crashed instead)."""
+    every recording; problem is "" or why the value was not understood. A
+    value that was given but not understood keeps every recording (deletes
+    nothing) rather than falling back to deleting, and never raises (the old
+    int() would have crashed Vox at start instead)."""
     v = "" if value is None else str(value).strip().lower()
     if not v:
         return default, ""
@@ -532,8 +535,9 @@ def parse_audio_keep(value, default=AUDIO_KEEP_DEFAULT):
         return None, ""
     try:
         n = int(float(v))
-    except ValueError:
-        return default, f"audio_keep {value!r} not understood; keeping the newest {default}"
+    except (ValueError, OverflowError):
+        return None, (f"audio_keep {value!r} not understood; keeping every "
+                      "recording (nothing is deleted)")
     if n <= 0:
         return None, ""  # 0 (and the old negative accident) = delete nothing
     return n, ""
@@ -565,8 +569,11 @@ AUDIO_CAP_GB, _AUDIO_CAP_PROBLEM = parse_cap_gb(
 # the link that makes a kept WAV usable for measuring and training later. No
 # record says anything about the application the text went into. Written only
 # when the WAV itself was saved; never deleted by the audio rotation.
-# VOX_AUDIO_RECORDS=0 (or "audio_records": false) turns records off.
-AUDIO_RECORDS = _setting("VOX_AUDIO_RECORDS", "audio_records", "1"
+# Default: on only when every recording is kept (audio_keep all), so a machine
+# without the new settings writes no records, exactly as before.
+# VOX_AUDIO_RECORDS=1/0 (or "audio_records": true/false) overrides that.
+AUDIO_RECORDS = _setting("VOX_AUDIO_RECORDS", "audio_records",
+                         "1" if AUDIO_KEEP is None else "0"
                          ).strip().lower() not in _OFF_WORDS
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -917,7 +924,10 @@ def rotate_audio(dest, keep):
             size = os.path.getsize(p)
         except OSError:
             size = 0
-        os.remove(p)
+        try:
+            os.remove(p)
+        except OSError:
+            continue  # locked (player, AV): skip it, the next rotation retries
         removed.append((f, size))
     return removed
 
@@ -2243,14 +2253,14 @@ def llm_format(text):
     dictation is never lost. Late finishers are discarded (which conveniently
     re-warms that backend for the next dictation).
     """
-    global last_cleanup
     if not LLM_CHAIN or not text.strip():
-        last_cleanup = {"outcome": "off" if not LLM_CHAIN else "empty"}
+        _cleanup_tls.value = {"outcome": "off" if not LLM_CHAIN else "empty"}
         return text
     t0 = time.monotonic()
     # What the cleanup pass did, for the dictation record (outcome, backend,
-    # seconds, and the text it was given). Set at every exit below.
-    last_cleanup = {"outcome": "error", "input": text}
+    # seconds, and the text it was given). Set at every exit below, per
+    # thread, so overlapping dictations never see each other's outcome.
+    _cleanup_tls.value = {"outcome": "error", "input": text}
     try:
         system = _cleanup_system_prompt()
         outcomes = {}          # chain index -> cleaned text, or None on failure
@@ -2313,20 +2323,20 @@ def llm_format(text):
                     f"'{LLM_CHAIN[i]}': {cleaned[:80]!r})")
                 continue
             log(f">> LLM cleanup ({LLM_CHAIN[i]}) in {time.monotonic() - t0:.2f}s")
-            last_cleanup = {"outcome": "ok", "backend": LLM_CHAIN[i],
-                            "model": _backend_model(i, LLM_CHAIN[i]),
-                            "secs": round(time.monotonic() - t0, 3),
-                            "input": text}
+            ok = {"outcome": "ok", "backend": LLM_CHAIN[i],
+                  "model": _backend_model(i, LLM_CHAIN[i]),
+                  "secs": round(time.monotonic() - t0, 3), "input": text}
             cleaned = _rejoin_split_words(text, cleaned)
             if LLM_STYLE != "rewrite":
                 cleaned = _keep_speaker_words(text, cleaned)
+            _cleanup_tls.value = ok   # only once the cleaned text is final
             return cleaned
         if not any(outcomes.values()):
             log(f">> LLM cleanup: no backend answered within {budget:.1f}s; "
                 "using raw text")
-        last_cleanup = {"outcome": ("no_answer" if not any(outcomes.values())
-                                    else "rejected"),
-                        "secs": round(time.monotonic() - t0, 3), "input": text}
+        _cleanup_tls.value = {"outcome": ("no_answer" if not any(outcomes.values())
+                                          else "rejected"),
+                              "secs": round(time.monotonic() - t0, 3), "input": text}
         return text
     except Exception as e:
         log(f">> LLM cleanup skipped ({e.__class__.__name__}: {e}); using raw text")
@@ -2680,7 +2690,7 @@ def audio_startup_report():
     cap = f"{AUDIO_CAP_GB:g} GB" if AUDIO_CAP_GB is not None else "none"
     log(f"  Audio:  keep {keep} (source: {AUDIO_KEEP_SOURCE}); {n} recordings, "
         f"{_fmt_gb(total)} in {dest}; size cap {cap}{free}")
-    log(f"  Records: {'on' if AUDIO_RECORDS else 'off (VOX_AUDIO_RECORDS=0)'}"
+    log(f"  Records: {'on' if AUDIO_RECORDS else 'off (on by default only with audio_keep all; audio_records overrides)'}"
         + (" (records-YYYY-MM-DD.jsonl beside the audio)" if AUDIO_RECORDS else ""))
     if over_cap(total, AUDIO_CAP_GB):
         _audio_cap_warned = True
@@ -2714,7 +2724,10 @@ supports_hotwords = False
 lock = threading.Lock()
 target_window = None
 last_llm_tokens = None
-last_cleanup = None   # llm_format's outcome for the current dictation (records)
+# llm_format's outcome for the dictation on THIS thread (records): each key
+# release transcribes on its own thread, so a global would let an overlapping
+# dictation overwrite another's outcome and cleanup input.
+_cleanup_tls = threading.local()
 
 # Segment prefetch: serializes every model.transcribe() call (see
 # transcribe_audio) because faster-whisper/ctranslate2 is not meant to be
@@ -3510,7 +3523,7 @@ def transcribe_audio(audio, with_hotwords=True, prev_text=None):
 
 def stop_and_transcribe():
     """Stop recording, transcribe, and type the result."""
-    global recording, last_llm_tokens, last_cleanup
+    global recording, last_llm_tokens
     t_release = time.monotonic()
     when = datetime.datetime.now().astimezone()  # names the WAV + its record
 
@@ -3520,7 +3533,7 @@ def stop_and_transcribe():
     hud.busy(hud_gen)
     tray.busy()
     last_llm_tokens = None
-    last_cleanup = None
+    _cleanup_tls.value = None
     # Capture the prefetch session for THIS dictation right away, mirroring
     # `local_stream = stream` below - both globals could otherwise be
     # reassigned out from under us if the next recording starts before this
@@ -3683,6 +3696,7 @@ def stop_and_transcribe():
 
     raw = text
     text = post_process(text)
+    cleanup = getattr(_cleanup_tls, "value", None)
     record = dict(raw=raw, asr_first=asr_first, echo_retry=echo_retry,
                   prefetch=prefetch_info, speech_sec=duration,
                   wav_sec=len(audio) / SAMPLE_RATE, mic=_mic_name)
@@ -3699,14 +3713,14 @@ def stop_and_transcribe():
         tray.idle()
         record_transcript(text.strip())
         record_dictation(saved, when, status="pasted", final=text,
-                         trailing_space=trailing, cleanup=last_cleanup,
+                         trailing_space=trailing, cleanup=cleanup,
                          latency_sec=latency, **record)
     else:
         hud.idle(hud_gen)
         tray.idle()
         log(">> No speech detected.")
         record_dictation(saved, when, status="no_speech", final="",
-                         cleanup=last_cleanup, **record)
+                         cleanup=cleanup, **record)
 
 
 def apply_hotkey(spec, persist=True):

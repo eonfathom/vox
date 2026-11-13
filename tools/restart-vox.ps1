@@ -14,7 +14,8 @@
 #                                        (works from inside the container)
 #
 # Exit code 0 = a "=== Vox ready ===" newer than the restart was found (or,
-# with -CheckOnly, any banner was found).
+# with -CheckOnly, any banner was found). Exit code 2 = refused before
+# touching anything, because this shell is sandboxed (see above).
 param(
     [switch]$CheckOnly,
     [string]$LogPath = ''
@@ -61,7 +62,11 @@ $started = Get-Date
 "restart-vox: $($started.ToString('yyyy-MM-dd HH:mm:ss')) root=$root"
 "restart-vox: LOCALAPPDATA=$env:LOCALAPPDATA"
 if ($env:LOCALAPPDATA -like '*\Packages\*') {
-    "restart-vox: WARNING - LOCALAPPDATA is inside an app package: this shell is sandboxed and Vox would not use its real folder."
+    # Fatal: restarting from here would start Vox inside the container (its
+    # audio, records and log in the private copy) and pause a guardian that
+    # never sees the pause file. Nothing has been touched yet.
+    "restart-vox: STOPPED - LOCALAPPDATA is inside an app package: this shell is sandboxed and Vox would not use its real folder. Nothing was restarted; run tools\restart-vox.cmd from Explorer or a normal terminal."
+    exit 2
 }
 & (Join-Path $root 'vox.ps1') restart
 

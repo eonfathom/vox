@@ -71,8 +71,39 @@ def test_parse_audio_keep():
     assert vx.parse_audio_keep(7) == (7, "")
     for keep_all in ("0", 0, "all", "ALL", "keep all", "unlimited", "-1"):
         assert vx.parse_audio_keep(keep_all) == (None, ""), keep_all
-    keep, problem = vx.parse_audio_keep("lots")
-    assert keep == 20 and "not understood" in problem
+    for keep_all in (True, "true", "yes", "everything"):
+        assert vx.parse_audio_keep(keep_all) == (None, ""), keep_all
+    # Given but not understood: never raises, and deletes nothing.
+    for bad in ("lots", "1e999", "-inf", float("-inf"), "nan"):
+        keep, problem = vx.parse_audio_keep(bad)
+        assert keep is None and "not understood" in problem, bad
+
+
+def _import_flags(**env):
+    """AUDIO_KEEP and AUDIO_RECORDS of a fresh import under `env` (env vars
+    beat settings.local.json, so the worktree's settings cannot interfere)."""
+    import subprocess
+    e = {k: v for k, v in os.environ.items()
+         if k not in ("VOX_AUDIO_KEEP", "VOX_AUDIO_RECORDS")}
+    e.update(env)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    out = subprocess.run(
+        [sys.executable, "-X", "utf8", "-c",
+         "import dictation as d; print(repr((d.AUDIO_KEEP, d.AUDIO_RECORDS)))"],
+        cwd=root, env=e, capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stderr[-2000:]
+    return eval(out.stdout.strip().splitlines()[-1])
+
+
+def test_records_default_follows_keep_all():
+    # This process imported with no VOX_AUDIO_* env: as on main, nothing new.
+    if not any(k in vx.SETTINGS for k in ("audio_keep", "audio_records")):
+        assert (vx.AUDIO_KEEP, vx.AUDIO_RECORDS) == (20, False)
+    assert _import_flags(VOX_AUDIO_KEEP="20") == (20, False)
+    assert _import_flags(VOX_AUDIO_KEEP="all") == (None, True)
+    assert _import_flags(VOX_AUDIO_KEEP="all", VOX_AUDIO_RECORDS="0") == (None, False)
+    assert _import_flags(VOX_AUDIO_KEEP="20", VOX_AUDIO_RECORDS="1") == (20, True)
+    assert _import_flags(VOX_AUDIO_KEEP="1e999") == (None, True)  # no crash at import
 
 
 def test_parse_cap_gb():
@@ -145,6 +176,32 @@ def test_rotate_keep_n_removes_oldest_wavs_only():
         assert [n for n, _ in removed] == names[:3]
         assert all(s == 100 for _, s in removed)
         assert sorted(os.listdir(d)) == sorted(names[3:] + ["records-2026-11-01.jsonl"])
+
+
+def test_rotate_skips_a_locked_wav_and_save_still_returns_path():
+    real_remove = os.remove
+    locked = "rec-20261101-000000.wav"
+
+    def _remove(p, *a, **k):
+        if os.path.basename(p) == locked:
+            raise PermissionError(32, "in use by another process", p)
+        return real_remove(p, *a, **k)
+
+    audio = np.zeros(160, dtype=np.float32)
+    with _Tmp() as d:
+        names = [f"rec-20261101-0000{i:02d}.wav" for i in range(4)]
+        for n in names:
+            _touch(os.path.join(d, n))
+        os.remove = _remove
+        try:
+            removed = vx.rotate_audio(d, 2)
+            assert [n for n, _ in removed] == [names[1]]
+            assert locked in os.listdir(d)
+            with _Patch(SAVE_AUDIO=d, AUDIO_KEEP=2, log=lambda *a, **k: None):
+                p = vx.save_debug_audio(audio, WHEN)
+            assert p and os.path.exists(p)  # the record still gets its WAV
+        finally:
+            os.remove = real_remove
 
 
 def test_audio_dir_usage():
@@ -241,7 +298,8 @@ def test_record_dictation_links_wav_and_respects_switches():
         with _Patch(AUDIO_RECORDS=False):
             assert vx.record_dictation(wav, WHEN, **kw) is None
         assert os.listdir(d) == ["rec-20261112-215407.wav"]
-        path = vx.record_dictation(wav, WHEN, **kw)
+        with _Patch(AUDIO_RECORDS=True):
+            path = vx.record_dictation(wav, WHEN, **kw)
         with open(path, encoding="utf-8") as f:
             row = json.loads(f.readline())
         assert os.path.exists(os.path.join(d, row["wav"]))
@@ -253,6 +311,44 @@ def test_record_dictation_links_wav_and_respects_switches():
         flat = json.dumps(row).lower()
         for word in ("app", "window", "process", "exe", "title"):
             assert f'"{word}' not in flat, word
+
+
+def test_cleanup_outcome_is_per_thread():
+    """Two overlapping dictations: B entering cleanup must not change what
+    A's record says about A's cleanup (outcome and input text)."""
+    import threading
+    a_done, b_done = threading.Event(), threading.Event()
+    seen = {}
+
+    def _a():
+        vx.llm_format("alpha words here")
+        a_done.set()
+        b_done.wait(10)
+        seen["a"] = getattr(vx._cleanup_tls, "value", None)
+
+    def _b():
+        a_done.wait(10)
+        vx.llm_format("bravo other words")
+        seen["b"] = getattr(vx._cleanup_tls, "value", None)
+        b_done.set()
+
+    with _Patch(LLM_CHAIN=["local"], LLM_BUDGET=2.0, LLM_BUDGET_MAX=2.0,
+                _llm_format_local=lambda text, *a, **k: text,
+                _cleanup_system_prompt=lambda *a, **k: "",
+                log=lambda *a, **k: None):
+        ts = [threading.Thread(target=f) for f in (_a, _b)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(20)
+        assert seen["a"]["input"] == "alpha words here", seen
+        assert seen["a"]["outcome"] == "ok" and seen["b"]["input"] == "bravo other words"
+
+        def _boom(*a, **k):
+            raise RuntimeError("helper failed")
+        with _Patch(_rejoin_split_words=_boom):
+            assert vx.llm_format("charlie three words") == "charlie three words"
+            assert vx._cleanup_tls.value["outcome"] == "error"  # not "ok"
 
 
 def test_stop_and_transcribe_end_to_end_with_stubs():
