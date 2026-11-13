@@ -15,7 +15,9 @@
 #
 # Exit code 0 = a "=== Vox ready ===" newer than the restart was found (or,
 # with -CheckOnly, any banner was found). Exit code 2 = refused before
-# touching anything, because this shell is sandboxed (see above).
+# touching anything, because a probe file written to %LOCALAPPDATA% was not
+# seen through \\localhost\C$ (this shell is sandboxed, see above, or the
+# admin share is unreachable). The probe is the only thing it writes.
 param(
     [switch]$CheckOnly,
     [string]$LogPath = ''
@@ -61,11 +63,33 @@ if ($CheckOnly) {
 $started = Get-Date
 "restart-vox: $($started.ToString('yyyy-MM-dd HH:mm:ss')) root=$root"
 "restart-vox: LOCALAPPDATA=$env:LOCALAPPDATA"
-if ($env:LOCALAPPDATA -like '*\Packages\*') {
+function Test-RealLocalAppData {
+    # True only when a file written under %LOCALAPPDATA% here is also seen
+    # through \\localhost\C$, i.e. this shell writes the real folder. Inside
+    # the Claude desktop app's container LOCALAPPDATA still reads
+    # C:\Users\<you>\AppData\Local, but writes land in a private copy, so the
+    # name alone cannot tell. (Its Temp subfolder is not redirected, so the
+    # probe goes in vox\, or in LOCALAPPDATA itself if vox\ does not exist.)
+    $la = $env:LOCALAPPDATA
+    if (-not $la -or $la -like '*\Packages\*' -or $la -notmatch '^[A-Za-z]:\\') { return $false }
+    $dir = Join-Path $la 'vox'
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { $dir = $la }
+    $marker = Join-Path $dir ('.restart-vox-probe-' + [guid]::NewGuid().ToString('N'))
+    try {
+        Set-Content -LiteralPath $marker -Value 'probe' -ErrorAction Stop
+        return [bool](Test-Path -LiteralPath ('\\localhost\' + $marker.Replace(':', '$')))
+    } catch {
+        return $false
+    } finally {
+        Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+    }
+}
+
+if (-not (Test-RealLocalAppData)) {
     # Fatal: restarting from here would start Vox inside the container (its
     # audio, records and log in the private copy) and pause a guardian that
     # never sees the pause file. Nothing has been touched yet.
-    "restart-vox: STOPPED - LOCALAPPDATA is inside an app package: this shell is sandboxed and Vox would not use its real folder. Nothing was restarted; run tools\restart-vox.cmd from Explorer or a normal terminal."
+    'restart-vox: STOPPED - a file written to LOCALAPPDATA here is not seen through \\localhost\C$: this shell is sandboxed (or the admin share is unreachable) and Vox would not use its real folder. Nothing was restarted; run tools\restart-vox.cmd from Explorer or a normal terminal.'
     exit 2
 }
 & (Join-Path $root 'vox.ps1') restart

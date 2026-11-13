@@ -570,10 +570,13 @@ AUDIO_CAP_GB, _AUDIO_CAP_PROBLEM = parse_cap_gb(
 # record says anything about the application the text went into. Written only
 # when the WAV itself was saved; never deleted by the audio rotation.
 # Default: on only when every recording is kept (audio_keep all), so a machine
-# without the new settings writes no records, exactly as before.
+# without the new settings writes no records, exactly as before. An
+# audio_keep value Vox could not read keeps every WAV but does not turn
+# records on (it may have meant "off").
 # VOX_AUDIO_RECORDS=1/0 (or "audio_records": true/false) overrides that.
 AUDIO_RECORDS = _setting("VOX_AUDIO_RECORDS", "audio_records",
-                         "1" if AUDIO_KEEP is None else "0"
+                         "1" if (AUDIO_KEEP is None and not _AUDIO_KEEP_PROBLEM)
+                         else "0"
                          ).strip().lower() not in _OFF_WORDS
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))

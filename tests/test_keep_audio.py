@@ -103,7 +103,11 @@ def test_records_default_follows_keep_all():
     assert _import_flags(VOX_AUDIO_KEEP="all") == (None, True)
     assert _import_flags(VOX_AUDIO_KEEP="all", VOX_AUDIO_RECORDS="0") == (None, False)
     assert _import_flags(VOX_AUDIO_KEEP="20", VOX_AUDIO_RECORDS="1") == (20, True)
-    assert _import_flags(VOX_AUDIO_KEEP="1e999") == (None, True)  # no crash at import
+    # A value Vox cannot read keeps every WAV but does not turn records on.
+    assert _import_flags(VOX_AUDIO_KEEP="1e999") == (None, False)  # no crash at import
+    assert _import_flags(VOX_AUDIO_KEEP="off") == (None, False)
+    assert _import_flags(VOX_AUDIO_KEEP="False") == (None, False)  # JSON false
+    assert _import_flags(VOX_AUDIO_KEEP="off", VOX_AUDIO_RECORDS="1") == (None, True)
 
 
 def test_parse_cap_gb():
