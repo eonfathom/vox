@@ -10,6 +10,9 @@ settings.local.json
 settings.local.json.tmp
 VOX_STATUS.md
 
+# Output of tools\restart-vox.cmd (startup banner only).
+tools/restart-vox.log
+
 # Generated from assets/vox-logo.png for the Windows startup shortcut.
 assets/vox-logo.ico
 
