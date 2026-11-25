@@ -1,0 +1,125 @@
+# Restart Vox through vox.ps1, then wait for its startup banner in the REAL
+# %LOCALAPPDATA%\vox\vox.log and print it (only the banner: never dictated text).
+#
+# Run it through tools\restart-vox.cmd, which is meant to be started OUTSIDE
+# a sandboxed shell. Inside the Claude desktop app's MSIX container
+# %LOCALAPPDATA% points at a private copy, so a Vox started from there would
+# keep its audio, records and log in the wrong folder, and the banner this
+# script waits for would never appear where it looks.
+#
+#   restart-vox.ps1                      restart, wait up to 150 s for the banner
+#   restart-vox.ps1 -CheckOnly           no restart: print the newest banner
+#   restart-vox.ps1 -CheckOnly -LogPath \\localhost\C$\Users\m\AppData\Local\vox\vox.log
+#                                        the same, read through the admin share
+#                                        (works from inside the container)
+#
+# Exit code 0 = a "=== Vox ready ===" newer than the restart was found (or,
+# with -CheckOnly, any banner was found). Exit code 2 = refused before
+# touching anything, because %LOCALAPPDATA% is not the user's own Local
+# AppData folder (overridden, as tests and agents do) or a probe file written
+# to it was not seen through \\localhost\C$ (this shell is sandboxed, see
+# above, or the admin share is unreachable). The probe is the only thing it
+# writes.
+param(
+    [switch]$CheckOnly,
+    [string]$LogPath = ''
+)
+$ErrorActionPreference = 'Continue'
+$root = Split-Path -Parent $PSScriptRoot
+$voxLog = if ($LogPath) { $LogPath } else { Join-Path $env:LOCALAPPDATA 'vox\vox.log' }
+
+function Get-Banner([string]$path, [datetime]$notBefore) {
+    # The newest ready line at or after $notBefore, plus the indented banner
+    # lines right after it ("YYYY-mm-dd HH:MM:SS,mmm " is 24 characters).
+    if (-not (Test-Path $path)) { return $null }
+    # The whole file: the banner sits at the top of a log that grows all day
+    # (vox.log rolls over at about 512 KB, at startup only).
+    $lines = @(Get-Content $path -Encoding UTF8)
+    for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+        $ln = $lines[$i]
+        if ($ln -notlike '*=== Vox ready ===*' -or $ln.Length -lt 19) { continue }
+        $t = [datetime]::MinValue
+        if (-not [datetime]::TryParseExact($ln.Substring(0, 19), 'yyyy-MM-dd HH:mm:ss',
+                [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::None, [ref]$t)) { continue }
+        if ($t -lt $notBefore) { return $null }
+        $out = @($ln)
+        for ($j = $i + 1; $j -lt $lines.Count; $j++) {
+            $msg = if ($lines[$j].Length -gt 24) { $lines[$j].Substring(24) } else { '' }
+            if ($msg.StartsWith('  ') -or $msg.StartsWith('>> Logging self-check')) {
+                $out += $lines[$j]
+            } else { break }
+        }
+        return $out
+    }
+    return $null
+}
+
+if ($CheckOnly) {
+    $banner = Get-Banner $voxLog ([datetime]::MinValue)
+    if ($banner) { $banner; exit 0 }
+    "restart-vox: no '=== Vox ready ===' in $voxLog"
+    exit 1
+}
+
+$started = Get-Date
+"restart-vox: $($started.ToString('yyyy-MM-dd HH:mm:ss')) root=$root"
+"restart-vox: LOCALAPPDATA=$env:LOCALAPPDATA"
+function Test-DefaultLocalAppData([string]$la, [string]$known) {
+    # True only when $la names the user's own Local AppData folder ($known,
+    # from the shell folder API, which ignores the LOCALAPPDATA variable).
+    # A LOCALAPPDATA pointed anywhere else (a test or agent scratch folder,
+    # often under the unredirected Temp) would pass the probe below while
+    # vox.ps1 kept its pause file and Vox its state in that other folder.
+    if (-not $la -or -not $known) { return $false }
+    return [bool]([string]::Equals($la.TrimEnd('\'), $known.TrimEnd('\'),
+        [StringComparison]::OrdinalIgnoreCase))
+}
+
+function Test-RealLocalAppData {
+    # True only when %LOCALAPPDATA% is the user's own Local AppData folder
+    # and a file written under it here is also seen through \\localhost\C$,
+    # i.e. this shell writes the real folder. Inside the Claude desktop app's
+    # container LOCALAPPDATA still reads C:\Users\<you>\AppData\Local, but
+    # writes land in a private copy, so the name alone cannot tell. (Its Temp
+    # subfolder is not redirected, so the probe goes in vox\, or in
+    # LOCALAPPDATA itself if vox\ does not exist.)
+    $la = $env:LOCALAPPDATA
+    if (-not (Test-DefaultLocalAppData $la ([Environment]::GetFolderPath('LocalApplicationData')))) { return $false }
+    if ($la -like '*\Packages\*' -or $la -notmatch '^[A-Za-z]:\\') { return $false }
+    $dir = Join-Path $la 'vox'
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { $dir = $la }
+    $marker = Join-Path $dir ('.restart-vox-probe-' + [guid]::NewGuid().ToString('N'))
+    try {
+        Set-Content -LiteralPath $marker -Value 'probe' -ErrorAction Stop
+        return [bool](Test-Path -LiteralPath ('\\localhost\' + $marker.Replace(':', '$')))
+    } catch {
+        return $false
+    } finally {
+        Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+    }
+}
+
+if (-not (Test-RealLocalAppData)) {
+    # Fatal: restarting from here would start Vox inside the container (its
+    # audio, records and log in the private copy) and pause a guardian that
+    # never sees the pause file. Nothing has been touched yet.
+    'restart-vox: STOPPED - LOCALAPPDATA is not your own Local AppData folder, or a file written to it here is not seen through \\localhost\C$: this shell is sandboxed or has LOCALAPPDATA overridden (or the admin share is unreachable) and Vox would not use its real folder. Nothing was restarted; run tools\restart-vox.cmd from Explorer or a normal terminal.'
+    exit 2
+}
+& (Join-Path $root 'vox.ps1') restart
+
+$deadline = $started.AddSeconds(150)
+$banner = $null
+while ((Get-Date) -lt $deadline -and -not $banner) {
+    Start-Sleep -Seconds 3
+    $banner = Get-Banner $voxLog $started.AddSeconds(-2)
+}
+& (Join-Path $root 'vox.ps1') status
+if ($banner) {
+    "restart-vox: Vox came back:"
+    $banner
+    exit 0
+}
+"restart-vox: no new '=== Vox ready ===' in $voxLog within 150 s"
+exit 1

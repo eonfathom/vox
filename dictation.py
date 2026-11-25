@@ -21,6 +21,7 @@ Requires: faster-whisper, sounddevice, numpy
 
 import collections
 import ctypes
+import datetime
 import inspect
 import json
 import logging
@@ -462,22 +463,121 @@ TAIL_MERGE = os.environ.get("VOX_TAIL_MERGE", "1").lower() not in (
 TAIL_MERGE_MAX_TAIL_SEC = float(os.environ.get("VOX_TAIL_MERGE_MAX_TAIL", "5.0"))
 TAIL_MERGE_MAX_TOTAL_SEC = float(os.environ.get("VOX_TAIL_MERGE_MAX_TOTAL", "14.0"))
 
-# Optional daily transcript record: point VOX_TRANSCRIPT_DIR at a directory
+_OFF_WORDS = ("0", "false", "off", "no")
+
+
+def _setting_source(env_name, key):
+    """Where _setting() found its value: the env var, the settings file, or
+    the built-in default (for the startup banner)."""
+    v = os.environ.get(env_name)
+    if v is not None and v.strip():
+        return env_name
+    s = SETTINGS.get(key)
+    if s is not None and str(s).strip():
+        return "settings.local.json"
+    return "default"
+
+
+def expand_dir(value):
+    """A directory setting with %VAR%, $VAR and ~ expanded; "" (or an off
+    word) means "not set". settings.local.json can then say
+    "%LOCALAPPDATA%\\vox\\transcripts", which resolves to the folder of
+    whoever runs Vox - the right one when Vox is started normally."""
+    v = str(value or "").strip().strip('"').strip()
+    if not v or v.lower() in _OFF_WORDS:
+        return ""
+    return os.path.normpath(os.path.expanduser(os.path.expandvars(v)))
+
+
+# Optional daily transcript record: point VOX_TRANSCRIPT_DIR (or
+# "transcript_dir" in settings.local.json; the env var wins) at a directory
 # (e.g. a folder inside an Obsidian vault) and the final text of every
 # dictation is appended to a per-day markdown file there ("YYYY-MM-DD vox.md",
-# one "- **HH:MM** text" bullet per dictation). Unset = off. Writing is
-# best-effort: a failure is logged and never blocks the paste.
-TRANSCRIPT_DIR = os.environ.get("VOX_TRANSCRIPT_DIR", "")
+# one "- **HH:MM** text" bullet per dictation). Unset = off; VOX_TRANSCRIPT_DIR=0
+# switches off a directory set in the settings file. Writing is best-effort: a
+# failure is logged and never blocks the paste.
+TRANSCRIPT_DIR = expand_dir(
+    _setting("VOX_TRANSCRIPT_DIR", "transcript_dir", ""))
+TRANSCRIPT_DIR_SOURCE = _setting_source("VOX_TRANSCRIPT_DIR", "transcript_dir")
 
-# Diagnostic audio retention: keep the raw audio of recent dictations as WAV
-# files so a bad transcription can be replayed and re-transcribed after the
-# fact - the transcript alone can't distinguish "Whisper mis-decoded the tail"
-# from "the microphone never delivered the speech" (e.g. another app grabbed
-# the device); the WAV answers that decisively. Default keeps the last 20
-# under %LOCALAPPDATA%\vox\audio (Linux: ~/.local/state/vox/audio).
-# VOX_SAVE_AUDIO=0 disables; VOX_SAVE_AUDIO=<dir> overrides the location.
+# Audio retention: keep the raw audio of dictations as WAV files so a bad
+# transcription can be replayed and re-transcribed after the fact - the
+# transcript alone can't distinguish "Whisper mis-decoded the tail" from "the
+# microphone never delivered the speech" (e.g. another app grabbed the device);
+# the WAV answers that decisively - and so Vox's own audio can later measure
+# and train it. Files go under %LOCALAPPDATA%\vox\audio (Linux:
+# ~/.local/state/vox/audio). VOX_SAVE_AUDIO=0 disables; VOX_SAVE_AUDIO=<dir>
+# overrides the location.
+#
+# How many to keep: VOX_AUDIO_KEEP, else "audio_keep" in settings.local.json,
+# else the newest 20. 0 or "all" keeps every recording (nothing is ever
+# deleted). Keeping everything is not allowed to grow silently: the folder's
+# size is logged at every start, and past VOX_AUDIO_CAP_GB / "audio_cap_gb"
+# (default 50 GB, 0 = no limit) Vox warns - in the log and once as a tray
+# notification - but still deletes nothing. Clearing space is the user's call.
 SAVE_AUDIO = os.environ.get("VOX_SAVE_AUDIO", "1")
-AUDIO_KEEP = int(os.environ.get("VOX_AUDIO_KEEP", "20"))
+AUDIO_KEEP_DEFAULT = 20
+_KEEP_ALL_WORDS = ("0", "all", "keep all", "keep-all", "keep_all",
+                   "unlimited", "forever", "every", "everything", "inf",
+                   "true", "yes")
+
+
+def parse_audio_keep(value, default=AUDIO_KEEP_DEFAULT):
+    """(keep, problem): keep is the newest-N count to keep, or None for keep
+    every recording; problem is "" or why the value was not understood. A
+    value that was given but not understood keeps every recording (deletes
+    nothing) rather than falling back to deleting, and never raises (the old
+    int() would have crashed Vox at start instead)."""
+    v = "" if value is None else str(value).strip().lower()
+    if not v:
+        return default, ""
+    if v in _KEEP_ALL_WORDS:
+        return None, ""
+    try:
+        n = int(float(v))
+    except (ValueError, OverflowError):
+        return None, (f"audio_keep {value!r} not understood; keeping every "
+                      "recording (nothing is deleted)")
+    if n <= 0:
+        return None, ""  # 0 (and the old negative accident) = delete nothing
+    return n, ""
+
+
+def parse_cap_gb(value, default=50.0):
+    """(cap_gb or None, problem). 0 or an off word = no size warning."""
+    v = "" if value is None else str(value).strip().lower()
+    if not v:
+        return default, ""
+    if v in _OFF_WORDS or v in ("none", "unlimited"):
+        return None, ""
+    try:
+        cap = float(v.removesuffix("gb").strip())
+    except ValueError:
+        return default, f"audio_cap_gb {value!r} not understood; using {default:g} GB"
+    return (cap if cap > 0 else None), ""
+
+
+AUDIO_KEEP, _AUDIO_KEEP_PROBLEM = parse_audio_keep(
+    _setting("VOX_AUDIO_KEEP", "audio_keep", ""))
+AUDIO_KEEP_SOURCE = _setting_source("VOX_AUDIO_KEEP", "audio_keep")
+AUDIO_CAP_GB, _AUDIO_CAP_PROBLEM = parse_cap_gb(
+    _setting("VOX_AUDIO_CAP_GB", "audio_cap_gb", ""))
+
+# Dictation records: one JSON line per kept recording, in a daily file beside
+# the audio (records-YYYY-MM-DD.jsonl): the WAV's file name, the time, the raw
+# recognizer text, the pasted text and the model and settings that made it -
+# the link that makes a kept WAV usable for measuring and training later. No
+# record says anything about the application the text went into. Written only
+# when the WAV itself was saved; never deleted by the audio rotation.
+# Default: on only when every recording is kept (audio_keep all), so a machine
+# without the new settings writes no records, exactly as before. An
+# audio_keep value Vox could not read keeps every WAV but does not turn
+# records on (it may have meant "off").
+# VOX_AUDIO_RECORDS=1/0 (or "audio_records": true/false) overrides that.
+AUDIO_RECORDS = _setting("VOX_AUDIO_RECORDS", "audio_records",
+                         "1" if (AUDIO_KEEP is None and not _AUDIO_KEEP_PROBLEM)
+                         else "0"
+                         ).strip().lower() not in _OFF_WORDS
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DICT_PATH = os.environ.get(
@@ -789,38 +889,192 @@ def level_profile(audio, win_sec=5):
     return " ".join(out)
 
 
-def save_debug_audio(audio):
-    """Keep the raw audio of recent dictations for after-the-fact diagnosis.
+def audio_dir():
+    """Where kept recordings go, or "" when saving is off (VOX_SAVE_AUDIO=0)."""
+    s = SAVE_AUDIO.strip()
+    if s.lower() in _OFF_WORDS or not s:
+        return ""
+    return os.path.join(_state_dir(), "audio") if s == "1" else s
 
-    Best-effort and rotating (newest AUDIO_KEEP kept): a failure is logged and
-    never blocks transcription. Returns the saved path or None.
+
+def unique_wav_path(dest, when=None):
+    """dest/rec-YYYYmmdd-HHMMSS.wav for `when` (a datetime, default now).
+    Two dictations inside one second used to overwrite each other - harmless
+    with 20 diagnostic files, data loss once every recording is kept - so a
+    taken name gets a -1, -2... suffix."""
+    stamp = (when or datetime.datetime.now()).strftime("rec-%Y%m%d-%H%M%S")
+    path = os.path.join(dest, stamp + ".wav")
+    n = 1
+    while os.path.exists(path):
+        path = os.path.join(dest, f"{stamp}-{n}.wav")
+        n += 1
+    return path
+
+
+def rotate_audio(dest, keep):
+    """Delete all but the newest `keep` rec-*.wav files in dest (by name,
+    which is by time). keep None = keep everything, delete nothing. Only WAVs
+    are touched: the daily records-*.jsonl files are never deleted. Returns
+    [(name, bytes)] of what was removed."""
+    if keep is None or keep <= 0:
+        return []
+    wavs = sorted(f for f in os.listdir(dest)
+                  if f.startswith("rec-") and f.endswith(".wav"))
+    removed = []
+    for f in wavs[:-keep]:
+        p = os.path.join(dest, f)
+        try:
+            size = os.path.getsize(p)
+        except OSError:
+            size = 0
+        try:
+            os.remove(p)
+        except OSError:
+            continue  # locked (player, AV): skip it, the next rotation retries
+        removed.append((f, size))
+    return removed
+
+
+def audio_dir_usage(dest):
+    """(recordings, total_bytes) for dest: rec-*.wav files counted, every
+    regular file's size summed (records included). Missing dir -> (0, 0)."""
+    n = total = 0
+    try:
+        it = os.scandir(dest)
+    except OSError:
+        return 0, 0
+    with it:
+        for e in it:
+            try:
+                if not e.is_file(follow_symlinks=False):
+                    continue
+                total += e.stat(follow_symlinks=False).st_size
+                if e.name.startswith("rec-") and e.name.endswith(".wav"):
+                    n += 1
+            except OSError:
+                pass
+    return n, total
+
+
+def over_cap(total_bytes, cap_gb):
+    """True when the kept-audio folder is past the size cap (GB = 10^9 B)."""
+    return cap_gb is not None and total_bytes > cap_gb * 1e9
+
+
+def _fmt_gb(nbytes):
+    return f"{nbytes / 1e9:.2f} GB"
+
+
+# Running size of the audio folder: measured at start (audio_startup_report),
+# then kept current from each save and rotation so the cap check never has to
+# rescan the folder on the dictation path. None until measured.
+_audio_bytes = None
+_audio_cap_warned = False
+
+
+def _account_audio(delta, dest):
+    """Track the folder size; warn ONCE per run when it crosses the cap."""
+    global _audio_bytes, _audio_cap_warned
+    if _audio_bytes is None:
+        return
+    _audio_bytes = max(0, _audio_bytes + delta)
+    if over_cap(_audio_bytes, AUDIO_CAP_GB) and not _audio_cap_warned:
+        _audio_cap_warned = True
+        log(f">> WARNING: kept audio is {_fmt_gb(_audio_bytes)}, past the "
+            f"{AUDIO_CAP_GB:g} GB cap ({dest}). Nothing is deleted - move or "
+            "prune old recordings, or raise audio_cap_gb.")
+
+
+def save_debug_audio(audio, when=None):
+    """Keep the raw audio of a dictation (see AUDIO_KEEP above).
+
+    Best-effort: a failure is logged and never blocks transcription. Rotates
+    to the newest AUDIO_KEEP unless every recording is kept. `when` (a
+    datetime) names the file; default now. Returns the saved path or None.
     """
-    if SAVE_AUDIO.strip().lower() in ("0", "false", "off", "no", ""):
+    dest = audio_dir()
+    if not dest:
         return None
     try:
-        dest = SAVE_AUDIO if SAVE_AUDIO != "1" else os.path.join(
-            _state_dir(), "audio"
-        )
         os.makedirs(dest, exist_ok=True)
-        path = os.path.join(
-            dest, time.strftime("rec-%Y%m%d-%H%M%S.wav")
-        )
+        path = unique_wav_path(dest, when)
         pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
         with wave.open(path, "wb") as w:
             w.setnchannels(1)
             w.setsampwidth(2)
             w.setframerate(SAMPLE_RATE)
             w.writeframes(pcm.tobytes())
-        stale = sorted(
-            f for f in os.listdir(dest)
-            if f.startswith("rec-") and f.endswith(".wav")
-        )[:-AUDIO_KEEP]
-        for f in stale:
-            os.remove(os.path.join(dest, f))
+        try:
+            _account_audio(os.path.getsize(path), dest)
+        except OSError:
+            pass
+        removed = rotate_audio(dest, AUDIO_KEEP)
+        if removed:
+            _account_audio(-sum(s for _, s in removed), dest)
         return path
     except Exception as e:
         log(f">> WARNING: could not save debug audio: {e}")
         return None
+
+
+def records_path(dest, when):
+    """The daily record file beside the audio for a recording made at `when`
+    (a datetime): dest/records-YYYY-MM-DD.jsonl."""
+    return os.path.join(dest, when.strftime("records-%Y-%m-%d.jsonl"))
+
+
+def build_record(wav_path, when, *, status, raw, final, speech_sec, wav_sec,
+                 mic="", asr_first=None, echo_retry=None, prefetch=None,
+                 cleanup=None, latency_sec=None, trailing_space=None,
+                 config=None):
+    """One dictation's record (a JSON-able dict, schema "v": 1).
+
+    id/wav: the recording's file name (relative, so the folder can move).
+    t: release time, ISO 8601 with UTC offset. raw: the recognizer's text
+    that went into post-processing (after the echo guard's choice);
+    asr_first: the first decode when the echo guard replaced it. final: the
+    pasted text ("" when nothing was pasted). Fields are only ever ADDED in
+    later versions, so readers can ignore what they don't know."""
+    name = os.path.basename(wav_path)
+    if when.tzinfo is None:
+        when = when.astimezone()  # naive local time -> with its UTC offset
+    rec = {
+        "v": 1,
+        "id": os.path.splitext(name)[0],
+        "wav": name,
+        "t": when.isoformat(timespec="seconds"),
+        "status": status,
+        "speech_sec": round(float(speech_sec), 3),
+        "wav_sec": round(float(wav_sec), 3),
+        "sample_rate": SAMPLE_RATE,
+        "mic": mic,
+        "raw": raw,
+        "final": final,
+    }
+    if asr_first is not None:
+        rec["asr_first"] = asr_first
+    if echo_retry is not None:
+        rec["echo_retry"] = echo_retry
+    if trailing_space is not None:
+        rec["trailing_space"] = bool(trailing_space)
+    if prefetch is not None:
+        rec["prefetch"] = prefetch
+    if cleanup is not None:
+        rec["cleanup"] = cleanup
+    if latency_sec is not None:
+        rec["latency_sec"] = round(float(latency_sec), 3)
+    if config is not None:
+        rec["config"] = config
+    return rec
+
+
+def append_record(path, rec):
+    """Append one record as a single JSON line (UTF-8, one write). Returns
+    the bytes written."""
+    line = json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n"
+    with open(path, "a", encoding="utf-8", newline="\n") as f:
+        f.write(line)
+    return len(line.encode("utf-8"))
 
 
 def _add_cuda_dll_dirs():
@@ -2003,8 +2257,13 @@ def llm_format(text):
     re-warms that backend for the next dictation).
     """
     if not LLM_CHAIN or not text.strip():
+        _cleanup_tls.value = {"outcome": "off" if not LLM_CHAIN else "empty"}
         return text
     t0 = time.monotonic()
+    # What the cleanup pass did, for the dictation record (outcome, backend,
+    # seconds, and the text it was given). Set at every exit below, per
+    # thread, so overlapping dictations never see each other's outcome.
+    _cleanup_tls.value = {"outcome": "error", "input": text}
     try:
         system = _cleanup_system_prompt()
         outcomes = {}          # chain index -> cleaned text, or None on failure
@@ -2067,13 +2326,20 @@ def llm_format(text):
                     f"'{LLM_CHAIN[i]}': {cleaned[:80]!r})")
                 continue
             log(f">> LLM cleanup ({LLM_CHAIN[i]}) in {time.monotonic() - t0:.2f}s")
+            ok = {"outcome": "ok", "backend": LLM_CHAIN[i],
+                  "model": _backend_model(i, LLM_CHAIN[i]),
+                  "secs": round(time.monotonic() - t0, 3), "input": text}
             cleaned = _rejoin_split_words(text, cleaned)
             if LLM_STYLE != "rewrite":
                 cleaned = _keep_speaker_words(text, cleaned)
+            _cleanup_tls.value = ok   # only once the cleaned text is final
             return cleaned
         if not any(outcomes.values()):
             log(f">> LLM cleanup: no backend answered within {budget:.1f}s; "
                 "using raw text")
+        _cleanup_tls.value = {"outcome": ("no_answer" if not any(outcomes.values())
+                                          else "rejected"),
+                              "secs": round(time.monotonic() - t0, 3), "input": text}
         return text
     except Exception as e:
         log(f">> LLM cleanup skipped ({e.__class__.__name__}: {e}); using raw text")
@@ -2343,6 +2609,101 @@ def record_transcript(text):
         log(f">> Transcript record failed ({e.__class__.__name__}: {e})")
 
 
+_vox_commit = None  # "<sha>[+dirty]" of the running code; set at startup
+
+
+def _dictionary_fingerprint():
+    """Short hash of the hotwords + corrections in force, so a record says
+    which vocabulary shaped it without copying personal names into it."""
+    import hashlib
+    blob = json.dumps([list(HOTWORDS), sorted(CORRECTIONS.items())],
+                      ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
+
+
+def record_config():
+    """The model and settings that shaped a dictation (for its record)."""
+    return {
+        "vox": _vox_commit or "",
+        "model": MODEL_SIZE,
+        "device": DEVICE,
+        "compute": COMPUTE_TYPE,
+        "beam": BEAM_SIZE,
+        "language": LANGUAGE,
+        "vad": True,
+        "prefetch": bool(PREFETCH),
+        "tail_merge": bool(TAIL_MERGE),
+        "release_tail_sec": RELEASE_TAIL_SEC,
+        "pad_sec": TRAILING_PAD_SEC,
+        "llm": [f"{b}:{_backend_model(i, b)}" for i, b in enumerate(LLM_CHAIN)],
+        "llm_style": LLM_STYLE,
+        "learn": bool(LEARN),
+        "hotwords": len(HOTWORDS),
+        "corrections": len(CORRECTIONS),
+        "learned_terms": LEARNED.get("n", 0),
+        "dictionary": _dictionary_fingerprint(),
+    }
+
+
+def record_dictation(wav_path, when, **fields):
+    """Append this dictation's record beside its kept WAV (see AUDIO_RECORDS).
+
+    Nothing is written when the WAV was not saved (audio off, a failed save,
+    or shadow replays, which stub the saver), so every record points at a
+    recording. Best-effort, after the paste: a failure is logged only."""
+    if not wav_path or not AUDIO_RECORDS:
+        return None
+    try:
+        rec = build_record(wav_path, when, config=record_config(), **fields)
+        path = records_path(os.path.dirname(wav_path), when)
+        _account_audio(append_record(path, rec), os.path.dirname(wav_path))
+        return path
+    except Exception as e:
+        log(f">> Dictation record failed ({e.__class__.__name__}: {e})")
+        return None
+
+
+def audio_startup_report():
+    """Startup banner lines for audio retention; measures the folder once
+    (the running total then follows each save) and warns past the cap.
+    Returns a warning string for a tray notification, or ""."""
+    global _audio_bytes, _audio_cap_warned, _vox_commit
+    try:
+        ok, sha, _ = _run_git(["rev-parse", "--short", "HEAD"], timeout=5)
+        _vox_commit = (sha + ("+dirty" if _tree_dirty() else "")) if ok else ""
+    except Exception:
+        _vox_commit = ""
+    for problem in (_AUDIO_KEEP_PROBLEM, _AUDIO_CAP_PROBLEM):
+        if problem:
+            log(f"  Audio:  *** {problem} ***")
+    dest = audio_dir()
+    if not dest:
+        log("  Audio:  not kept (VOX_SAVE_AUDIO=0); no dictation records")
+        return ""
+    keep = ("every recording" if AUDIO_KEEP is None
+            else f"newest {AUDIO_KEEP}")
+    n, total = audio_dir_usage(dest)
+    _audio_bytes = total
+    free = ""
+    try:
+        import shutil
+        free = f", {_fmt_gb(shutil.disk_usage(dest if os.path.isdir(dest) else os.path.dirname(dest)).free)} free on disk"
+    except Exception:
+        pass
+    cap = f"{AUDIO_CAP_GB:g} GB" if AUDIO_CAP_GB is not None else "none"
+    log(f"  Audio:  keep {keep} (source: {AUDIO_KEEP_SOURCE}); {n} recordings, "
+        f"{_fmt_gb(total)} in {dest}; size cap {cap}{free}")
+    log(f"  Records: {'on' if AUDIO_RECORDS else 'off (on by default only with audio_keep all; audio_records overrides)'}"
+        + (" (records-YYYY-MM-DD.jsonl beside the audio)" if AUDIO_RECORDS else ""))
+    if over_cap(total, AUDIO_CAP_GB):
+        _audio_cap_warned = True
+        msg = (f"Kept audio is {_fmt_gb(total)}, past the {AUDIO_CAP_GB:g} GB "
+               f"cap. Nothing is deleted; prune {dest} or raise audio_cap_gb.")
+        log(f"  Audio:  *** WARNING: {msg} ***")
+        return msg
+    return ""
+
+
 # --- Global state ---
 recording = False
 audio_frames = []
@@ -2366,6 +2727,10 @@ supports_hotwords = False
 lock = threading.Lock()
 target_window = None
 last_llm_tokens = None
+# llm_format's outcome for the dictation on THIS thread (records): each key
+# release transcribes on its own thread, so a global would let an overlapping
+# dictation overwrite another's outcome and cleanup input.
+_cleanup_tls = threading.local()
 
 # Segment prefetch: serializes every model.transcribe() call (see
 # transcribe_audio) because faster-whisper/ctranslate2 is not meant to be
@@ -3162,6 +3527,8 @@ def transcribe_audio(audio, with_hotwords=True, prev_text=None):
 def stop_and_transcribe():
     """Stop recording, transcribe, and type the result."""
     global recording, last_llm_tokens
+    t_release = time.monotonic()
+    when = datetime.datetime.now().astimezone()  # names the WAV + its record
 
     # Tag every HUD update with this dictation's session, so a slow transcription
     # finishing after the user re-pressed the chord can't stomp the new recording.
@@ -3169,6 +3536,7 @@ def stop_and_transcribe():
     hud.busy(hud_gen)
     tray.busy()
     last_llm_tokens = None
+    _cleanup_tls.value = None
     # Capture the prefetch session for THIS dictation right away, mirroring
     # `local_stream = stream` below - both globals could otherwise be
     # reassigned out from under us if the next recording starts before this
@@ -3202,7 +3570,7 @@ def stop_and_transcribe():
         + (f", {overflow_count} overflow flags" if overflow_count else "")
         + ")...")
     log(f">> Levels (dBFS per 5s): {level_profile(audio)}")
-    saved = save_debug_audio(audio)
+    saved = save_debug_audio(audio, when)
     if saved:
         log(f">> Audio kept: {saved}")
 
@@ -3214,6 +3582,7 @@ def stop_and_transcribe():
     # tail: blocks[:session.last_cut] were already transcribed in the
     # background, blocks[session.last_cut:] were not.
     text = None
+    prefetch_info = None  # for the dictation record
     if session is not None:
         session.stop_flag.set()
         if session.thread is not None and session.thread.is_alive():
@@ -3280,6 +3649,13 @@ def stop_and_transcribe():
                 f"pre-done; tail {tail_sec:.1f}s"
                 + (" merged with last seg" if merge_start is not None else "")
                 + f" (decoded in {tail_decode_sec:.2f}s)")
+            prefetch_info = {
+                "segs": len(session.texts),
+                "pre_done_sec": round(pre_done_sec, 3),
+                "tail_sec": round(tail_sec, 3),
+                "tail_merged": merge_start is not None,
+                "tail_decode_sec": round(tail_decode_sec, 3),
+            }
             segs = seg_texts + [tail_text]
             text = repair_segment_joins(segs)
             if text != " ".join(t for t in segs if t):
@@ -3307,6 +3683,7 @@ def stop_and_transcribe():
     # real speech) and keep whichever result preserved more speech. Measured on
     # the length AFTER stripping, so we compare real content, not echo noise.
     # Dictionary corrections still run on the winner via post_process.
+    asr_first, echo_retry = None, None
     cleaned = clean_text(text)
     stripped = strip_phantoms(cleaned, quiet=True)
     if stripped != cleaned:
@@ -3314,26 +3691,39 @@ def stop_and_transcribe():
         retry_stripped = strip_phantoms(clean_text(retry), quiet=True)
         log(f">> Echo detected; retried without hotwords "
             f"({len(stripped)} -> {len(retry_stripped)} chars of real speech)")
+        echo_retry = "kept_first"
         if len(retry_stripped) > len(stripped):
             log(">> Recovered lost speech via no-hotword retry")
+            asr_first, echo_retry = text, "used_retry"
             text = retry
 
+    raw = text
     text = post_process(text)
+    cleanup = getattr(_cleanup_tls, "value", None)
+    record = dict(raw=raw, asr_first=asr_first, echo_retry=echo_retry,
+                  prefetch=prefetch_info, speech_sec=duration,
+                  wav_sec=len(audio) / SAMPLE_RATE, mic=_mic_name)
 
     if text:
         text, trailing = smart_case(text)
         log(f">> Result: {text}")
         type_text(text, target_window, trailing_space=trailing)
+        latency = time.monotonic() - t_release  # release -> pasted
         _note_paste(text)
         _learn_note_paste(text)
         hud.done(words=len(text.split()), secs=duration,
                  tokens=last_llm_tokens, gen=hud_gen)
         tray.idle()
         record_transcript(text.strip())
+        record_dictation(saved, when, status="pasted", final=text,
+                         trailing_space=trailing, cleanup=cleanup,
+                         latency_sec=latency, **record)
     else:
         hud.idle(hud_gen)
         tray.idle()
         log(">> No speech detected.")
+        record_dictation(saved, when, status="no_speech", final="",
+                         cleanup=cleanup, **record)
 
 
 def apply_hotkey(spec, persist=True):
@@ -3731,8 +4121,10 @@ def write_status_doc():
     else:
         update_line = "offline (could not reach origin)"
     dirty = _tree_dirty()
-    hotwords, corrections = load_dictionary()
-    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    # load_dictionary() returns four values since learn-from-edits; unpacking
+    # two raised ValueError and the tray's status doc never got written.
+    hotwords, corrections = load_dictionary()[:2]
+    now =time.strftime("%Y-%m-%d %H:%M:%S")
     settings_note = "" if os.path.exists(SETTINGS_PATH) else " (not yet created)"
     lines = [
         "# Vox status",
@@ -3761,6 +4153,12 @@ def write_status_doc():
             for i, b in enumerate(LLM_CHAIN)
         ) or "off"),
         f"- Dictionary: {len(hotwords)} hotwords, {len(corrections)} corrections",
+        "- Audio kept: " + (("every recording" if AUDIO_KEEP is None
+                             else f"newest {AUDIO_KEEP}")
+                            + f" in `{audio_dir()}` (source: {AUDIO_KEEP_SOURCE})"
+                            if audio_dir() else "off (VOX_SAVE_AUDIO=0)"),
+        f"- Transcript dir: `{TRANSCRIPT_DIR}`" if TRANSCRIPT_DIR
+        else "- Transcript dir: off",
         f"- Autostart: {_autostart_state()}",
         f"- Settings file: `{SETTINGS_PATH}`{settings_note}",
         "",
@@ -4016,7 +4414,19 @@ def main():
         f" ({len(LEARNED['hotwords'])} as hotwords, "
         f"{len(LEARNED['corrections'])} corrections)")
     if TRANSCRIPT_DIR:
-        log(f"  Transcript dir: {TRANSCRIPT_DIR}")
+        log(f"  Transcript dir: {TRANSCRIPT_DIR} (source: {TRANSCRIPT_DIR_SOURCE})")
+    # Audio retention + records, stated every run with the folder's size, so
+    # keeping everything can never grow unnoticed (see AUDIO_KEEP).
+    try:
+        cap_warning = audio_startup_report()
+    except Exception as e:
+        cap_warning = ""
+        log(f"  Audio:  report failed ({e.__class__.__name__}: {e})")
+    if cap_warning:
+        try:
+            tray.notify(cap_warning, "Vox: kept audio is large")
+        except Exception:
+            pass
 
     # Logging health, stated every run. A windowless Vox that cannot log is
     # undiagnosable, and that state once persisted twelve days unnoticed - so

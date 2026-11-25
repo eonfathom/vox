@@ -128,11 +128,31 @@ Configuration is via environment variables.
 | `VOX_HUD` | `1` | Floating dictation HUD (Windows): a click-through overlay pinned above the taskbar at the bottom-right of the monitor you're dictating into — a red plus, live elapsed timer, and mic level meter while you hold the chord; then a release-to-paste latency clock and a brief `words · tokens` result flash. `0` to disable |
 | `VOX_HUD_ANCHOR` | `corner` | `caret` anchors to the text insertion point where the OS exposes it (static fallback elsewhere); `cursor` follows the mouse live |
 | `VOX_LOG` | auto | Diagnostic log file (rotating, 512 KB × 2). Default `%LOCALAPPDATA%\vox\vox.log` (Linux: `~/.local/state/vox/vox.log`); set a path to move it or `0` to disable |
-| `VOX_TRANSCRIPT_DIR` | unset | Directory (e.g. an Obsidian folder) for a per-day markdown record of everything you dictate (`YYYY-MM-DD vox.md`, one `- **HH:MM** text` bullet per dictation). Unset = off |
+| `VOX_TRANSCRIPT_DIR` | unset | Directory (e.g. an Obsidian folder) for a per-day markdown record of everything you dictate (`YYYY-MM-DD vox.md`, one `- **HH:MM** text` bullet per dictation). Also `"transcript_dir"` in `settings.local.json` (`%LOCALAPPDATA%`-style variables are expanded). Unset = off; `0` switches off a directory set in the settings file |
+| `VOX_SAVE_AUDIO` | `1` | Keep each dictation's audio as a 16 kHz mono WAV in `%LOCALAPPDATA%\vox\audio` (Linux: `~/.local/state/vox/audio`). A path moves the folder; `0` keeps no audio (and writes no dictation records) |
+| `VOX_AUDIO_KEEP` | `20` | How many recordings to keep (the oldest WAVs beyond that are deleted). `0` or `all` keeps every recording and deletes nothing; so does a value Vox cannot read (it logs a warning at start). Also `"audio_keep"` in `settings.local.json`; the env var wins (so `VOX_AUDIO_KEEP=20` restores the old rotation) |
+| `VOX_AUDIO_CAP_GB` | `50` | Size warning for the audio folder. Its size is logged at every start; past the cap Vox logs a warning (and shows one tray notification) but never deletes anything. Also `"audio_cap_gb"`; `0` = no warning |
+| `VOX_AUDIO_RECORDS` | on with `audio_keep` `all`, else off (also off when `audio_keep` is a value Vox cannot read) | One JSON line per kept recording in a daily `records-YYYY-MM-DD.jsonl` beside the audio (see *Keeping your recordings*). Also `"audio_records"`; `1` turns records on with the newest-N rotation too, `0` turns them off |
 | `VOX_LLM` | `off` | Optional LLM cleanup pass. `local` = a local OpenAI-compatible server (Ollama; offline, no API key); `anthropic` = Claude via API (needs `ANTHROPIC_API_KEY`); a comma list (`anthropic,local`) is a preference chain — backends race in parallel and the earliest-listed success wins, so cloud quality degrades to local automatically when offline |
 | `VOX_LLM_MODEL` | `qwen3:4b-instruct` (local) / `claude-haiku-4-5` (anthropic) | Model per backend. With a chain, a comma list aligned by position (`claude-haiku-4-5,qwen3:4b-instruct`); unset positions use the per-backend defaults. The local default is the smallest model that reliably rewrites spoken self-corrections (see benchmark note in `dictation.py`); warm ~0.7–1.2s even on CPU |
 | `VOX_LLM_URL` | `http://127.0.0.1:11434/v1` | Local server's OpenAI-compatible base URL (Ollama default; works with LM Studio, llama.cpp `--api`, etc.). Use `127.0.0.1`, not `localhost` — on Windows the latter stalls ~2s per request on IPv6 fallback |
 | `VOX_LLM_KEEPALIVE` | `30m` | Keep the local model resident between dictations so there's no reload latency (Ollama) |
+
+### Keeping your recordings
+
+By default Vox keeps the newest 20 WAVs, for diagnosing a bad dictation. To keep every recording, so your own dictations can later measure or train the recognizer, put this in `settings.local.json` (git-ignored, read at start; an environment variable still wins):
+
+```json
+{
+  "audio_keep": "all",
+  "transcript_dir": "%LOCALAPPDATA%\\vox\\transcripts"
+}
+```
+
+- **Audio:** `rec-YYYYmmdd-HHMMSS.wav` in `%LOCALAPPDATA%\vox\audio`. Two dictations in the same second get `-1`, `-2` suffixes instead of overwriting each other.
+- **Records:** beside the audio, `records-YYYY-MM-DD.jsonl` gets one line per recording: `id` and `wav` (the file name, relative), `t` (release time with UTC offset), `status` (`pasted` or `no_speech`), `speech_sec`, `wav_sec`, `mic`, `raw` (the recognizer's text going into cleanup), `final` (the pasted text), `asr_first` and `echo_retry` (when the echo guard re-decoded), `prefetch` (segment counts and times), `cleanup` (outcome, backend, seconds and the text it was given), `latency_sec` (release to paste), and `config` (Vox commit, model, device, beam, language, cleanup model and style, dictionary size and fingerprint). Records never name the application the text went into. They are on by default only when every recording is kept (`audio_keep` `all`; `audio_records` overrides either way), written only when the WAV was saved, and the rotation never deletes them. Fields are only ever added, so readers should ignore keys they don't know.
+- **Size:** the startup log states the folder's recordings, size, cap and free disk space (`Audio:` line). Nothing is ever deleted automatically while `audio_keep` is `all`; past `audio_cap_gb` (default 50 GB) you get a warning instead.
+- **Restart Vox** after editing the file. On a machine where your shell runs inside a sandboxed app (the Claude desktop app's MSIX container redirects `%LOCALAPPDATA%`), restart it from outside with `tools\restart-vox.cmd` (see the comments in that file).
 
 Example — force the tiny model on CPU:
 
@@ -181,7 +201,7 @@ Every configuration is **fully fail-safe**: no server/key, no internet, a timeou
 
 **Edit, don't rewrite (`VOX_LLM_STYLE`, default `edit`).** The model's output is treated as proposed edits and checked word by word against what you said. These edits stand: punctuation, capitals, removing fillers (um, uh, filler "like"/"so"), removing stutters and repeated false starts, dropping a phrase you corrected ("…on Monday, no wait, Tuesday"), fixing a near-spelling or homophone (carat → caret, there → their), and writing numbers as digits. Everything else the model changed is undone and your own words go back in place. Measured against Wispr Flow on the same audio (shadow mode below, 67 dictations): no cleanup matched Wispr's words 93.4% of the time. The free rewrite matched 78.2%, because it paraphrases even when told not to. Edit mode matched 94.4% and cut the sentences Vox wrongly ended at a pause from 21 to 9. `VOX_LLM_STYLE=rewrite` restores the old behaviour.
 
-**Per-machine settings.** Every `VOX_LLM*` setting can also go in `settings.local.json` next to `dictation.py` (`"llm"`, `"llm_url"`, `"llm_model"`, `"llm_style"`). That turns cleanup on for one machine without a user-wide environment variable. An environment variable still wins.
+**Per-machine settings.** Every `VOX_LLM*` setting can also go in `settings.local.json` next to `dictation.py` (`"llm"`, `"llm_url"`, `"llm_model"`, `"llm_style"`). That turns cleanup on for one machine without a user-wide environment variable. An environment variable still wins. The same goes for `"audio_keep"`, `"audio_cap_gb"`, `"audio_records"` and `"transcript_dir"` (see *Keeping your recordings*).
 
 **Missing-model fallback.** If the configured local model isn't actually installed on the server (a fresh machine, a pruned Ollama), every cleanup would 404 identically — and under `pythonw` nothing makes that visible, so raw text would paste for weeks. Vox now detects this at warm-up, switches to the best *installed* known-good model (`qwen3:4b-instruct` → `qwen2.5:3b-instruct` → `qwen2.5:1.5b-instruct`), and logs the `ollama pull` command that restores the configured one.
 
